@@ -239,38 +239,38 @@ class EfficientBFS(OptimalAlg):
         new_lbd = node.v.lbd_v
 
         # 3. 提取出高密度冗余簇
+        # ... (上半部分寻找 cluster 的代码保持不变) ...
+
+        # 3. 提取出高密度冗余簇
         candidate_T0 = list(set(node.candidate) - set(cluster))
 
         # === T0 预评估 (快速预判切除这 k 个巨头后的后果) ===
         ub_T0 = self.g(node.s) + self.fast_evaluate_ub(node.s, candidate_T0, node.budget)
 
         if ub_T0 * self.alpha > self.g(self.s_max):
-            # 糟糕，即使排除了这 k 个最强元素，T0 依然无法被剪枝
-            # 说明这个 cluster 找得没有战略意义，熔断保护！
+            # 熔断保护：T0 杀不死，退化为普通二叉分支
             return self.branching(node, heuristic_sequence)
         else:
-            # T0 必死！放心地将搜索空间沿着这 k 个平替元素撕裂！
+            # T0 必死！使用 MECE 阶梯分割法完美覆盖剩余空间
 
-            # 注意：为了适配 DFS，入栈顺序依然必须是 1 到 k
-            for i in range(1, k + 1):
-                included_elements = cluster[:i]
-                excluded_elements = cluster[i:]  # (概念上，我们排除了簇内后续元素)
+            # ⚠️ 倒序循环 (从 k-1 递减到 0)
+            # 先 push 最弱的分支 (沉在栈底)，最后 push 最强的 T_0 分支 (浮在栈顶供 DFS 优先探索)
+            for i in range(k - 1, -1, -1):
+                target_ele = cluster[i]
 
-                # 检查预算是否合法
-                cost_included = sum([self.model.cost_of_singleton(e) for e in included_elements])
-                if node.budget >= cost_included:
-                    new_s = list(base_set | set(included_elements))
-                    # 子节点的候选集：踢掉整个簇
-                    new_candidate_Ti = list(set(node.candidate) - set(cluster))
+                if node.budget >= self.model.cost_of_singleton(target_ele):
+                    new_s = list(base_set | {target_ele})
 
-                    # 💡 极其关键的修正：
-                    # 因为我们现在是横向强行提取的 cluster，它偏离了贪心路径 heuristic_sequence。
-                    # 所以，所有生成的子节点都必须设置 first_child=False 并且 heuristic_sequence=None
-                    # 强迫它们出堆/出栈时重新跑一次 greedy_add，确保上界计算准确。
+                    # 💡 完备性核心逻辑：
+                    # 当前分支必须排除 cluster 中排在 target_ele 前面的所有元素
+                    # 也就是排除了 cluster[:i]，同时自己 target_ele 被选中了也不在候选集里
+                    # 所以新的候选集 = 原候选集 - cluster[:i+1]
+                    new_candidate_Ti = list(set(node.candidate) - set(cluster[:i + 1]))
                     self.push_heap(s=new_s, lbd_v=new_lbd, first_child=False,
                                    heuristic_sequence=None,
                                    candidate=new_candidate_Ti,
-                                   w=node.budget - cost_included, s_max_v=self.g(self.s_max))
+                                   w=node.budget - self.model.cost_of_singleton(target_ele),
+                                   s_max_v=self.g(self.s_max))
                     open_list_change += 1
 
             return open_list_change
