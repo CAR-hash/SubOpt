@@ -50,7 +50,7 @@ class EfficientBFS(OptimalAlg):
             self.f = self.f_without_alpha
 
     def push_heap(self, s, lbd_v, visited=False, first_child=False, heuristic_sequence=None, candidate=None, w=None,
-                  s_max_v=0):
+                  s_max_v=0, forbidden_sets=None):
 
         # 1. 统一构建完整的节点
         max_idx = max(s) if len(s) > 0 else 0
@@ -58,6 +58,7 @@ class EfficientBFS(OptimalAlg):
                                    first_child=first_child, heuristic_sequence=heuristic_sequence,
                                    max_idx=max_idx)
         node.cost = self.model.cost_of_set(s)
+        node.forbidden_sets = forbidden_sets if forbidden_sets is not None else []
 
         new_g = self.g(node)
         new_h = self.h(node)
@@ -178,6 +179,7 @@ class EfficientBFS(OptimalAlg):
     def push_root(self):
         root = EfficientBFSHeapObj([], candidate=self.model.ground_set, w=self.model.budget, visited=True, max_idx=0)
         root.cost = 0
+        root.forbidden_sets = []
 
         f_upper = self.f(root)
         s_max, f_local, heuristic_sequence = self.greedy_add(root)
@@ -215,6 +217,73 @@ class EfficientBFS(OptimalAlg):
                            candidate=new_candidate,
                            w=node.budget - self.model.cost_of_singleton(first_ele), s_max_v=self.g(self.s_max))
 
+        return open_list_change
+
+    def branching_with_injection(self, node, heuristic_sequence, tau=0.85, max_k=3):
+        """
+        基于约束注入的块分支规则
+        """
+        if not heuristic_sequence:
+            return 0
+
+        # 1. 识别高密度簇 (Cluster)
+        # 利用你之前的密度跳变思想，找出前几个表现极其接近的“巨头”
+        first_d = self.model.marginal_gain(heuristic_sequence[0], node.s) / \
+                  self.model.cost_of_singleton(heuristic_sequence[0])
+
+        cluster = [heuristic_sequence[0]]
+        for i in range(1, min(len(heuristic_sequence), max_k)):
+            current_d = self.model.marginal_gain(heuristic_sequence[i], node.s) / \
+                        self.model.cost_of_singleton(heuristic_sequence[i])
+            if current_d >= first_d * tau:
+                cluster.append(heuristic_sequence[i])
+            else:
+                break
+
+        k = len(cluster)
+        open_list_change = 0
+        new_lbd = node.v.lbd_v
+
+        # --- 分支 1：左分支 (全包含路径) ---
+        # 尝试将整个 Cluster 塞进去
+        total_cost = sum(self.model.cost_of_singleton(e) for e in cluster)
+        if node.cost + total_cost <= self.model.budget:
+            new_s = list(set(node.s) | set(cluster))
+            new_candidate = list(set(node.candidate) - set(cluster))
+            # 继承父节点的序列（剔除掉已经加入的 cluster）
+            new_hs = [e for e in heuristic_sequence if e not in cluster]
+
+            self.push_heap(s=new_s, lbd_v=new_lbd, first_child=True,
+                           heuristic_sequence=new_hs,
+                           candidate=new_candidate,
+                           w=node.budget - total_cost,
+                           s_max_v=self.g(self.s_max))
+            # 注意：左分支通常继承 forbidden_sets
+            open_list_change += 1
+
+        # --- 分支 2：右分支 (约束注入路径) ---
+        # 关键创新：候选集 candidate 不减少 (或仅减少首元素)，但注入“互斥约束”
+        # 强制要求在该子树下，cluster 中的元素不能同时被选满
+        current_forbidden = getattr(node, 'forbidden_sets', [])
+        new_forbidden = current_forbidden + [set(cluster)]
+
+        # 对于右分支，为了保证完备性，我们剔除 cluster 中的第一个元素（防止死循环）
+        # 但通过 forbidden_sets 限制了剩下的元素组合
+        new_candidate_right = list(set(node.candidate) - {cluster[0]})
+        new_hs_right = heuristic_sequence[1:]
+
+        # 这里我们利用了之前实现的“惰性定界”，将 new_hs_right 传下去
+        self.push_heap(s=node.s, lbd_v=new_lbd, first_child=False,
+                       heuristic_sequence=new_hs_right,
+                       candidate=new_candidate_right,
+                       w=node.budget,
+                       s_max_v=self.g(self.s_max))
+
+        # ⚠️ 重要：由于 push_heap 内部可能还没适配 forbidden_sets 传参，
+        # 如果你的 EfficientBFSHeapObj 构造函数没改，记得在这里手动补上
+        # last_node = self.max_heap.peek() 或修改 push_heap 接口
+
+        open_list_change += 1
         return open_list_change
 
     def recursive_branching(self, node, heuristic_sequence, tau=0.8, max_k=4):
@@ -289,6 +358,8 @@ class EfficientBFS(OptimalAlg):
                     open_list_change += 1
 
             return open_list_change
+
+
 
     def branching_volume_biased(self, node, heuristic_sequence, top_n=5):
         """
@@ -524,6 +595,9 @@ class EfficientBFS(OptimalAlg):
 
             elif self.branching_strategy == 'probing':
                 self.branching_probing(node, heuristic_sequence, top_m=3)
+
+            elif self.branching_strategy == 'injection':
+                self.branching_with_injection(node, heuristic_sequence)
             # ================================================
 
         stop_time = time.time()

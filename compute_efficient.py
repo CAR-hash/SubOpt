@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     # 修改：支持传入一个列表，如果不传则默认跑完全部 4 种策略
     parser.add_argument("-bs", "--branching", nargs='+',
-                        default=['traditional', 'density_gap', 'volume_biased', 'probing'],
+                        default=['traditional', 'density_gap', 'volume_biased', 'probing', 'injection'],
                         help="list of branching strategies to test (space-separated)")
 
     parser.add_argument("--start_seed", type=int, default=0)
