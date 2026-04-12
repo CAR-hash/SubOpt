@@ -27,9 +27,7 @@ if __name__ == "__main__":
     parser.add_argument("-ls", "--local-search",action='store_true',help='enable local search hybrid')
     # 增加一个开关参数
     parser.add_argument("-dive", "--use_dive", action="store_true", help="enable Dive-and-Bound (DFS-BFS Hybrid)")
-
     args = parser.parse_args()
-
     assert args.heuristic in ['ub0', 'ub1', 'ub2', 'ub0+', 'ub1+', 'ub2+', 'ub4', 'dom']
 
     interval = 1

@@ -96,6 +96,8 @@ class EfficientBFS(OptimalAlg):
         budget = node.budget
 
         sol = set(base)
+        forbidden_sets = getattr(node, 'forbidden_sets', [])
+
         remaining_elements = set(candidate)
         cur_cost = 0  # Tracks the cost of elements added ON TOP of the base
 
@@ -119,6 +121,19 @@ class EfficientBFS(OptimalAlg):
 
             # 2. Pop the element with the highest upper-bound density
             neg_ds, _, u = heapq.heappop(h)
+
+            # === 约束注入拦截逻辑 ===
+            is_forbidden = False
+            for f_set in forbidden_sets:
+                # 如果禁用的集合 f_set 只差元素 u 就凑齐了，那么 u 不能加
+                if u in f_set:
+                    # 检查当前解是否已经包含了 f_set 中除了 u 以外的所有元素
+                    if f_set - {u} <= sol:
+                        is_forbidden = True
+                        break
+            if is_forbidden:
+                continue
+                # ========================
 
             # 3. Lazy Budget Check: Discard instantly if it no longer fits the knapsack
             cost_u = self.model.cost_of_singleton(u)
@@ -393,66 +408,6 @@ class EfficientBFS(OptimalAlg):
         node_count = 0
         open_list_count = 1
 
-        # while self.max_heap.size() > 0:
-        #     node: EfficientBFSHeapObj = self.max_heap.pop()
-        #
-        #     node_count += 1
-        #     s = node.s
-        #     v = node.v
-        #
-        #     # print(f"new node popped:{s}, {v.lbd_v}, {len(node.candidate)}")
-        #
-        #     f_local, heuristic_sequence = node.v.lbd_v, None
-        #     if not node.visited and not node.first_child:
-        #         s_final, f_local, heuristic_sequence = self.greedy_add(node)
-        #         # node.v.lbd_v = min(node.v.lbd_v, f_local)
-        #         f_upper = min(f_upper, node.v.lbd_v)
-        #
-        #         if self.g(s_final) > self.g(self.s_max):
-        #             self.s_max = s_final
-        #
-        #         if self.local_search:
-        #             if self.g(s_final) > 0.98 * self.g(self.s_max):
-        #                 enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, node.candidate)
-        #                 if enhanced_val > self.g(self.s_max):
-        #                     self.s_max = enhanced_s
-        #                     print(f"LS improved LB to {enhanced_val:.2f}")
-        #             # print(f"s_max updated:{self.s_max}, early pruning:{min(node.v.lbd_v, f_local) * self.alpha}")
-        #
-        #         if min(node.v.lbd_v, f_local) * self.alpha <= self.g(self.s_max):
-        #             continue
-        #
-        #         if self.use_alpha:
-        #             if self.g(self.s_max) >= f_upper:
-        #                 sol = self.s_max
-        #                 break
-        #         else:
-        #             if self.g(self.s_max) >= self.alpha * f_upper:
-        #                 sol = self.s_max
-        #                 break
-        #
-        #     if node.visited or node.first_child:
-        #         heuristic_sequence = node.heuristic_sequence
-        #
-        #     if self.is_on_the_edge(node):
-        #         continue
-        #
-        #     # ================= 对比实验开关 =================
-        #     if self.branching_strategy == "traditional":
-        #         # 策略 A: 传统二元分支
-        #         self.branching(node, heuristic_sequence)
-        #
-        #     elif self.branching_strategy == "density_gap":
-        #         # 策略 D: 密度跳变多叉分支
-        #         self.recursive_branching(node, heuristic_sequence, tau=0.8, max_k=4)
-        #
-        #     elif self.branching_strategy == 'volume_biased':
-        #         self.branching_volume_biased(node, heuristic_sequence, top_n=5)
-        #
-        #     elif self.branching_strategy == 'probing':
-        #         self.branching_probing(node, heuristic_sequence, top_m=3)
-        #     # ================================================
-
         while self.max_heap.size() > 0 or len(self.dfs_stack) > 0:
             # ================= 节点弹出逻辑 (双引擎切换) =================
             if len(self.dfs_stack) > 0:
@@ -481,35 +436,73 @@ class EfficientBFS(OptimalAlg):
             # =========================================================
 
             f_local, heuristic_sequence = node.v.lbd_v, None
-            if not node.visited and not node.first_child:
-                s_final, f_local, heuristic_sequence = self.greedy_add(node)
-                # node.v.lbd_v = min(node.v.lbd_v, f_local)
-                f_upper = min(f_upper, node.v.lbd_v)
 
-                if self.g(s_final) > self.g(self.s_max):
-                    self.s_max = s_final
+            # 只有未访问过的节点需要评估
+            if not node.visited:
+                safety_margin = 1.05
+                is_safe = (node.v.lbd_v * self.alpha > self.g(self.s_max) * safety_margin)
+                has_legacy = (node.heuristic_sequence is not None and len(node.heuristic_sequence) > 0)
 
-                if self.local_search:
-                    if self.g(s_final) > 0.98 * self.g(self.s_max):
-                        # enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, node.candidate)
-                        # ✅ 修改为 self.model.ground_set
-                        enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, self.model.ground_set)
-                        if enhanced_val > self.g(self.s_max):
-                            self.s_max = enhanced_s
-                            print(f"LS improved LB to {enhanced_val:.2f}")
-                    # print(f"s_max updated:{self.s_max}, early pruning:{min(node.v.lbd_v, f_local) * self.alpha}")
+                # 左分支直接沿用老路，绝对不跑 greedy_add
+                if node.first_child and has_legacy:
+                    f_local = node.v.lbd_v
+                    heuristic_sequence = node.heuristic_sequence
 
-                if min(node.v.lbd_v, f_local) * self.alpha <= self.g(self.s_max):
-                    continue
+                # 右分支虽然偏离轨道，但如果上界看起来很高，懒得去精确计算，直接放行
+                elif not node.first_child and is_safe and has_legacy:
+                    f_local = node.v.lbd_v
+                    heuristic_sequence = node.heuristic_sequence
 
-                if self.use_alpha:
-                    if self.g(self.s_max) >= f_upper:
-                        sol = self.s_max
-                        break
+                # 🛑 只有一种情况跑 greedy_add：
+                # 右分支（或根节点）且上界逼近危险区！必须重算精确上界进行剪杀，或寻找新的 s_max 路线。
                 else:
-                    if self.g(self.s_max) >= self.alpha * f_upper:
-                        sol = self.s_max
-                        break
+                    s_final, f_local, heuristic_sequence = self.greedy_add(node)
+                    f_upper = min(f_upper, node.v.lbd_v)
+
+                    # --- 更新全局最优 LB ---
+                    if self.g(s_final) > self.g(self.s_max):
+                        self.s_max = s_final
+
+                    # --- Local Search 兜底提界 ---
+                    if self.local_search:
+                        if self.g(s_final) > 0.98 * self.g(self.s_max):
+                            enhanced_s, enhanced_val = self.fast_local_swap_hs(self.s_max, heuristic_sequence)
+                            if enhanced_val > self.g(self.s_max):
+                                self.s_max = enhanced_s
+                                print(f"🚀 [LS Hit] Improved global LB to {enhanced_val:.2f}")
+
+
+            # f_local, heuristic_sequence = node.v.lbd_v, None
+            # if not node.visited and not node.first_child:
+            #     s_final, f_local, heuristic_sequence = self.greedy_add(node)
+            #     # node.v.lbd_v = min(node.v.lbd_v, f_local)
+            #     f_upper = min(f_upper, node.v.lbd_v)
+            #
+            #     if self.g(s_final) > self.g(self.s_max):
+            #         self.s_max = s_final
+            #
+            #     if self.local_search:
+            #         if self.g(s_final) > 0.98 * self.g(self.s_max):
+            #             # enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, node.candidate)
+            #             # ✅ 修改为 self.model.ground_set
+            #             # enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, self.model.ground_set)
+            #             enhanced_s, enhanced_val = self.fast_local_swap_hs(self.s_max, heuristic_sequence)
+            #             if enhanced_val > self.g(self.s_max):
+            #                 self.s_max = enhanced_s
+            #                 print(f"LS improved LB to {enhanced_val:.2f}")
+            #         # print(f"s_max updated:{self.s_max}, early pruning:{min(node.v.lbd_v, f_local) * self.alpha}")
+            #
+            #     if min(node.v.lbd_v, f_local) * self.alpha <= self.g(self.s_max):
+            #         continue
+            #
+            #     if self.use_alpha:
+            #         if self.g(self.s_max) >= f_upper:
+            #             sol = self.s_max
+            #             break
+            #     else:
+            #         if self.g(self.s_max) >= self.alpha * f_upper:
+            #             sol = self.s_max
+            #             break
 
             if node.visited or node.first_child:
                 heuristic_sequence = node.heuristic_sequence
@@ -580,4 +573,39 @@ class EfficientBFS(OptimalAlg):
                 if improved:
                     break
 
+        return best_sol, best_val
+
+    def fast_local_swap_hs(self, current_sol, candidate_set, max_candidates=30):
+        """
+        首优退出版 Local Search
+        :param current_sol: 当前解
+        :param candidate_set: 候选集 (建议传入节点的 heuristic_sequence 而不是整个 ground_set)
+        :param max_candidates: 截断参数，限制最大扫描数量，防止退化为 O(kn)
+        """
+        budget = self.model.budget
+        best_sol = list(current_sol)
+        best_val = self.g(best_sol)
+        current_cost = self.model.cost_of_set(best_sol)
+
+        out_candidates = list(best_sol)
+
+        in_candidates = list(set(candidate_set) - set(best_sol))
+        if max_candidates and len(in_candidates) > max_candidates:
+            in_candidates = in_candidates[:max_candidates]
+
+        for e_out in out_candidates:
+            for e_in in in_candidates:
+                cost_diff = self.model.cost_of_singleton(e_in) - self.model.cost_of_singleton(e_out)
+
+                # 检查背包容量
+                if current_cost + cost_diff <= budget:
+                    temp_sol = list((set(best_sol) - {e_out}) | {e_in})
+                    temp_val = self.g(temp_sol)
+
+                    # 优化点 2：首优退出 (First Improvement)
+                    # 只要发现界限有提升，立刻返回给 BFS 外层，不做任何多余的留恋和列表维护
+                    if temp_val > best_val:
+                        return temp_sol, temp_val
+
+        # 如果遍历完截断的候选集都没有发现任何提升，原样返回
         return best_sol, best_val
