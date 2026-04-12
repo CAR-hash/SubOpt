@@ -86,6 +86,7 @@ if __name__ == "__main__":
                 node_cnt = res.get('node_count', -1)
                 time_cost = res.get('time', 0.0)
                 function_val = res.get('f(S)', 0.0)
+                print(f"trigger count:{res.get('probing_trigger_count', 0)}, depth_list:{res.get('probing_trigger_depth_list', [])}, max_depth:{res.get('max_depth', 0)}")
                 print(f"  ✅ Strategy: {strategy_name_for_file:<14s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | Time: {time_cost:.2f}s")
 
                 # 文件保存

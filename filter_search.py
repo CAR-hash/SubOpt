@@ -1788,10 +1788,8 @@ class BFSTC(OptimalAlg):
         stop_time = time.time()
 
         assert sol is not None, "No solution found."
-
         ret = {'S': sol, 'c(S)': self.model.cost_of_set(sol), 'f(S)': self.model.objective(sol), 'TLE': self.TLE,
                'time': stop_time - self.start_time, 'node_count': node_count, "open_list_count": open_list_count}
-
         return ret
 
 

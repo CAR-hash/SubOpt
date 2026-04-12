@@ -35,11 +35,27 @@ class EfficientBFS(OptimalAlg):
         self.dive_max_nodes = 50  # 下潜深度/广度限制：每次下潜最多探索 50 个节点，防止卡死
         self.current_dive_count = 0  # 当前下潜计数器
 
+        self.probing_trigger_count = 0  # the number of nodes where probing succeed to discard the first element in hs
+        self.probing_trigger_depth_list = []  # record the depth of each probing-effective point
+        self.probing_trigger_depth_list = []  # record the depth of each probing-effective point
+        self.max_depth = 0
+
+        # === 级联 EMA 自适应控制器 ===
+        self.m_current = 3
+        # 初始认为 0, 1, 2 三个位置都有可能赢 (总和为1)
+        self.ema_probs = [0.34, 0.33, 0.33]
+        self.ema_alpha = 0.15
+        self.ema_threshold = 0.05
+
     def build(self):
         if self.heap_class == 'tradition':
             self.max_heap = MaxHeap()
         elif self.heap_class == 'simple':
             self.max_heap = SimpleMaxHeap()
+
+        self.probing_trigger_count = 0
+        self.probing_trigger_depth_list = []
+        self.max_depth = 0
 
         self.max_heap.clear()
         self.ground_size = len(self.model.ground_set)
@@ -50,7 +66,7 @@ class EfficientBFS(OptimalAlg):
             self.f = self.f_without_alpha
 
     def push_heap(self, s, lbd_v, visited=False, first_child=False, heuristic_sequence=None, candidate=None, w=None,
-                  s_max_v=0):
+                  s_max_v=0, depth=0):
 
         # 1. 统一构建完整的节点
         max_idx = max(s) if len(s) > 0 else 0
@@ -58,6 +74,7 @@ class EfficientBFS(OptimalAlg):
                                    first_child=first_child, heuristic_sequence=heuristic_sequence,
                                    max_idx=max_idx)
         node.cost = self.model.cost_of_set(s)
+        node.depth = depth
 
         new_g = self.g(node)
         new_h = self.h(node)
@@ -163,6 +180,7 @@ class EfficientBFS(OptimalAlg):
     def push_root(self):
         root = EfficientBFSHeapObj([], candidate=self.model.ground_set, w=self.model.budget, visited=True, max_idx=0)
         root.cost = 0
+        root.depth = 0
 
         f_upper = self.f(root)
         s_max, f_local, heuristic_sequence = self.greedy_add(root)
@@ -185,7 +203,7 @@ class EfficientBFS(OptimalAlg):
 
         # push second child
         self.push_heap(s=node.s, lbd_v=new_lbd, first_child=False,
-                       candidate=new_candidate, w=node.budget, s_max_v=self.g(self.s_max))
+                       candidate=new_candidate, w=node.budget, s_max_v=self.g(self.s_max), depth=node.depth + 1)
         open_list_change += 1
 
         # print(f"current lb_star:{self.g(s_max)}, first ele:{first_ele}, density:{self.model.density(first_ele,s)}")
@@ -239,9 +257,6 @@ class EfficientBFS(OptimalAlg):
         new_lbd = node.v.lbd_v
 
         # 3. 提取出高密度冗余簇
-        # ... (上半部分寻找 cluster 的代码保持不变) ...
-
-        # 3. 提取出高密度冗余簇
         candidate_T0 = list(set(node.candidate) - set(cluster))
 
         # === T0 预评估 (快速预判切除这 k 个巨头后的后果) ===
@@ -270,7 +285,8 @@ class EfficientBFS(OptimalAlg):
                                    heuristic_sequence=None,
                                    candidate=new_candidate_Ti,
                                    w=node.budget - self.model.cost_of_singleton(target_ele),
-                                   s_max_v=self.g(self.s_max))
+                                   s_max_v=self.g(self.s_max),
+                                   depth=node.depth + 1)
                     open_list_change += 1
 
             return open_list_change
@@ -305,7 +321,8 @@ class EfficientBFS(OptimalAlg):
                        heuristic_sequence=None,
                        candidate=new_candidate,
                        w=node.budget,
-                       s_max_v=self.g(self.s_max))
+                       s_max_v=self.g(self.s_max),
+                       depth=node.depth + 1)
         open_list_change += 1
 
         # Child 1: Include target_ele
@@ -317,13 +334,19 @@ class EfficientBFS(OptimalAlg):
                            heuristic_sequence=None,
                            candidate=new_candidate,
                            w=node.budget - self.model.cost_of_singleton(target_ele),
-                           s_max_v=self.g(self.s_max))
-
-
-
+                           s_max_v=self.g(self.s_max),
+                           depth=node.depth + 1)
         return open_list_change
 
     def branching_probing(self, node, heuristic_sequence, top_m=3):
+        # 只要当前的 UB 距离我们手里握着的全局 LB 还有一段距离
+        # 就说明这棵树还有很大的剪枝潜力，不要心疼算力，老老实实火力全开 (m=3) 去排雷
+        if node.v.lbd_v > 1.1 * self.g(self.s_max):
+            m = 3
+        else:
+            # 如果 UB 已经跟 LB 差不多了，哪怕找到“承重墙”也剪不了多少树了
+            # 这时候再降级到 m=1 或 m=2
+            m = 1
         """
         策略 C：探测分支 (Strong Branching / Probing)。
         对前 top_m 个高密度元素进行剔除模拟，选择能让 UB 降得最低的元素进行分支。
@@ -334,6 +357,10 @@ class EfficientBFS(OptimalAlg):
 
         best_ele = pool[0]
         lowest_ub = float('inf')
+
+        # 假设当前节点的初始评估上限是 node.v.lbd_v
+        if node.v.lbd_v > 1.15 * self.g(self.s_max):
+            return self.branching(node, heuristic_sequence)
 
         # 1. 模拟探测：寻找杀伤力最大的元素
         for e in pool:
@@ -347,6 +374,11 @@ class EfficientBFS(OptimalAlg):
 
         # 2. 选定最佳目标进行分支
         target_ele = best_ele
+
+        if target_ele != pool[0]:
+            self.probing_trigger_count += 1
+            self.probing_trigger_depth_list.append(node.depth)
+
         new_candidate = list(set(node.candidate) - {target_ele})
         new_lbd = node.v.lbd_v
         open_list_change = 0
@@ -358,7 +390,8 @@ class EfficientBFS(OptimalAlg):
                        heuristic_sequence=None,
                        candidate=new_candidate,
                        w=node.budget,
-                       s_max_v=self.g(self.s_max))
+                       s_max_v=self.g(self.s_max),
+                       depth=node.depth + 1)
         open_list_change += 1
 
         # Child 1: Include
@@ -370,7 +403,80 @@ class EfficientBFS(OptimalAlg):
                            heuristic_sequence=None,
                            candidate=new_candidate,
                            w=node.budget - self.model.cost_of_singleton(target_ele),
-                           s_max_v=self.g(self.s_max))
+                           s_max_v=self.g(self.s_max),
+                           depth=node.depth + 1)
+
+        return open_list_change
+
+    def branching_probing_adapt(self, node, heuristic_sequence):
+        if self.m_current == 1:
+            return self.branching(node, heuristic_sequence)
+
+        # 1. 动态确定本次探测宽度
+        m = self.m_current
+        pool = heuristic_sequence[:m]
+        if not pool: return 0
+
+        best_ele = pool[0]
+        lowest_ub = float('inf')
+
+        # 2. 执行探测
+        for e in pool:
+            temp_candidates = set(node.candidate) - {e}
+            simulated_ub = self.fast_evaluate_ub(node.s, temp_candidates, node.budget)
+            if simulated_ub < lowest_ub:
+                lowest_ub = simulated_ub
+                best_ele = e
+
+        # 3. 统计命中情况
+        hit_index = pool.index(best_ele)
+
+        # ================= 级联 EMA 核心逻辑 =================
+        # 批量更新当前活跃的几个 Index 的存活概率
+        for i in range(self.m_current):
+            is_hit = 1.0 if i == hit_index else 0.0
+            self.ema_probs[i] = self.ema_alpha * is_hit + (1 - self.ema_alpha) * self.ema_probs[i]
+
+        # 从后往前判定降级
+        if self.m_current == 3 and self.ema_probs[2] < self.ema_threshold:
+            self.m_current = 2
+            # print(f"📉 [EMA] 第3名长期无效 (概率跌至 {self.ema_probs[2]:.3f})，降级为 m=2")
+        elif self.m_current == 2 and self.ema_probs[1] < self.ema_threshold:
+            self.m_current = 1
+            # print(f"📉 [EMA] 第2名长期无效 (概率跌至 {self.ema_probs[1]:.3f})，退化为无探测贪心 (m=1)")
+        # ===================================================
+        target_ele = best_ele
+        # ... 后续 push_heap 逻辑 ...
+        if target_ele != pool[0]:
+            self.probing_trigger_count += 1
+            self.probing_trigger_depth_list.append(node.depth)
+
+        new_candidate = list(set(node.candidate) - {target_ele})
+        new_lbd = node.v.lbd_v
+        open_list_change = 0
+
+        # Child 2: Exclude
+        self.push_heap(s=node.s,
+                       lbd_v=new_lbd,
+                       first_child=False,
+                       heuristic_sequence=None,
+                       candidate=new_candidate,
+                       w=node.budget,
+                       s_max_v=self.g(self.s_max),
+                       depth=node.depth + 1)
+        open_list_change += 1
+
+        # Child 1: Include
+        if node.cost + self.model.cost_of_singleton(target_ele) <= self.model.budget:
+            open_list_change += 1
+            self.push_heap(s=list(set(node.s) | {target_ele}),
+                           lbd_v=new_lbd,
+                           first_child=False,  # 理由同上：非顺序截断需强制重算
+                           heuristic_sequence=None,
+                           candidate=new_candidate,
+                           w=node.budget - self.model.cost_of_singleton(target_ele),
+                           s_max_v=self.g(self.s_max),
+                           depth=node.depth + 1)
 
         return open_list_change
 
@@ -386,72 +492,13 @@ class EfficientBFS(OptimalAlg):
             stop_time = time.time()
             ret = {'S': sol, 'c(S)': self.model.cost_of_set(sol), 'f(S)': self.model.objective(sol),
                    'time': stop_time - start_time, 'node_count': 1, "open_list_count": 1,
-                   "push_back_count": 0}
+                   'push_back_count': 0, 'probing_trigger_count': 0, 'probing_depth_list': [],
+                   'max_depth': self.max_depth}
             return ret
 
         sol = self.s_max
         node_count = 0
         open_list_count = 1
-
-        # while self.max_heap.size() > 0:
-        #     node: EfficientBFSHeapObj = self.max_heap.pop()
-        #
-        #     node_count += 1
-        #     s = node.s
-        #     v = node.v
-        #
-        #     # print(f"new node popped:{s}, {v.lbd_v}, {len(node.candidate)}")
-        #
-        #     f_local, heuristic_sequence = node.v.lbd_v, None
-        #     if not node.visited and not node.first_child:
-        #         s_final, f_local, heuristic_sequence = self.greedy_add(node)
-        #         # node.v.lbd_v = min(node.v.lbd_v, f_local)
-        #         f_upper = min(f_upper, node.v.lbd_v)
-        #
-        #         if self.g(s_final) > self.g(self.s_max):
-        #             self.s_max = s_final
-        #
-        #         if self.local_search:
-        #             if self.g(s_final) > 0.98 * self.g(self.s_max):
-        #                 enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, node.candidate)
-        #                 if enhanced_val > self.g(self.s_max):
-        #                     self.s_max = enhanced_s
-        #                     print(f"LS improved LB to {enhanced_val:.2f}")
-        #             # print(f"s_max updated:{self.s_max}, early pruning:{min(node.v.lbd_v, f_local) * self.alpha}")
-        #
-        #         if min(node.v.lbd_v, f_local) * self.alpha <= self.g(self.s_max):
-        #             continue
-        #
-        #         if self.use_alpha:
-        #             if self.g(self.s_max) >= f_upper:
-        #                 sol = self.s_max
-        #                 break
-        #         else:
-        #             if self.g(self.s_max) >= self.alpha * f_upper:
-        #                 sol = self.s_max
-        #                 break
-        #
-        #     if node.visited or node.first_child:
-        #         heuristic_sequence = node.heuristic_sequence
-        #
-        #     if self.is_on_the_edge(node):
-        #         continue
-        #
-        #     # ================= 对比实验开关 =================
-        #     if self.branching_strategy == "traditional":
-        #         # 策略 A: 传统二元分支
-        #         self.branching(node, heuristic_sequence)
-        #
-        #     elif self.branching_strategy == "density_gap":
-        #         # 策略 D: 密度跳变多叉分支
-        #         self.recursive_branching(node, heuristic_sequence, tau=0.8, max_k=4)
-        #
-        #     elif self.branching_strategy == 'volume_biased':
-        #         self.branching_volume_biased(node, heuristic_sequence, top_n=5)
-        #
-        #     elif self.branching_strategy == 'probing':
-        #         self.branching_probing(node, heuristic_sequence, top_m=3)
-        #     # ================================================
 
         while self.max_heap.size() > 0 or len(self.dfs_stack) > 0:
             # ================= 节点弹出逻辑 (双引擎切换) =================
@@ -479,6 +526,9 @@ class EfficientBFS(OptimalAlg):
                     self.current_dive_count = 0
                     print(f"🌊 [DIVE] Initiating Dive at BFS node {node_count}...")
             # =========================================================
+
+            if self.max_depth < node.depth:
+                self.max_depth = node.depth
 
             f_local, heuristic_sequence = node.v.lbd_v, None
             if not node.visited and not node.first_child:
@@ -530,7 +580,7 @@ class EfficientBFS(OptimalAlg):
                 self.branching_volume_biased(node, heuristic_sequence, top_n=5)
 
             elif self.branching_strategy == 'probing':
-                self.branching_probing(node, heuristic_sequence, top_m=3)
+                self.branching_probing(node, heuristic_sequence)
             # ================================================
 
         stop_time = time.time()
@@ -538,7 +588,8 @@ class EfficientBFS(OptimalAlg):
         assert sol is not None, "No solution found."
 
         ret = {'S': sol, 'c(S)': self.model.cost_of_set(sol), 'f(S)': self.model.objective(sol),
-               'time': stop_time - start_time, 'node_count': node_count, "open_list_count": open_list_count}
+               'time': stop_time - start_time, 'node_count': node_count, "open_list_count": open_list_count, 'probing_trigger_count': self.probing_trigger_count,
+               'probing_trigger_depth_list': self.probing_trigger_depth_list, 'max_depth': self.max_depth}
 
         return ret
 

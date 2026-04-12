@@ -36,11 +36,12 @@ class HeapObj(BaseHeapObj):
 
 class EfficientBFSHeapObj(HeapObj):
     def __init__(self, s, v=None, cost=None, candidate=None, w=0, first_child=False, heuristic_sequence=None, max_idx=0,
-                 visited=False):
+                 visited=False, depth=0):
         super().__init__(s, v, cost, candidate=candidate, w=w, max_idx=max_idx, visited=visited)
 
         self.first_child = first_child
         self.heuristic_sequence = heuristic_sequence
+        self.depth = depth
 
 
 class BranchAndBoundNode(HeapObj):
