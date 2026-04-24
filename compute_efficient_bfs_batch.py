@@ -23,13 +23,13 @@ if __name__ == "__main__":
     # 每个配置包含：名称标签, 分支策略, 上界类型, 是否开启继承
     experiments = [
         {"tag": "Standard", "bs": "traditional", "ub": "ub2", "inh": True},
-        {"tag": "NoInherit", "bs": "traditional", "ub": "ub2", "inh": False},
-        {"tag": "PlainUB", "bs": "traditional", "ub": "ub0", "inh": True},
-        {"tag": "NaiveBS", "bs": "naive", "ub": "ub2", "inh": True},
+        # {"tag": "NoInherit", "bs": "traditional", "ub": "ub2", "inh": False},
+        # {"tag": "PlainUB", "bs": "traditional", "ub": "ub0", "inh": True},
+        # {"tag": "NaiveBS", "bs": "naive", "ub": "ub2", "inh": True},
     ]
 
     # 设置 Budget 范围
-    bds = np.linspace(start=6, stop=25, num=20)
+    bds = np.linspace(start=12, stop=15, num=4)
     root_dir = os.path.join("./result", f"archive-{args.archive}")
 
     for seed in range(args.start_seed, args.stop_seed):

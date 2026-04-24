@@ -208,7 +208,7 @@ class CalTechMaximization(BaseTask):
 
         intact_graph: nx.Graph = nx.Graph(sparse)
 
-        # print(len(intact_graph))
+        # print(self.max_nodes)
 
         if self.max_nodes <= len(intact_graph.nodes):
             nodes = random.sample(list(intact_graph.nodes), self.max_nodes)
