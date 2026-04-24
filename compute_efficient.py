@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     # 修改：支持传入一个列表，如果不传则默认跑完全部 4 种策略
     parser.add_argument("-bs", "--branching", nargs='+',
-                        default=['traditional', 'density_gap', 'volume_biased', 'probing', 'injection'],
+                        default=['traditional', 'density_gap', 'look_ahead'],
                         help="list of branching strategies to test (space-separated)")
 
     parser.add_argument("--start_seed", type=int, default=0)
@@ -27,11 +27,16 @@ if __name__ == "__main__":
     parser.add_argument("-ls", "--local-search",action='store_true',help='enable local search hybrid')
     # 增加一个开关参数
     parser.add_argument("-dive", "--use_dive", action="store_true", help="enable Dive-and-Bound (DFS-BFS Hybrid)")
+    # 不使用界限继承的开关（传入该参数则关闭继承）
+    parser.add_argument("-ni", "--no_inherit", action="store_true", help="disable bound inheritance mechanism")
+    # 注入级联机制
+    parser.add_argument("-ca", "--cascade", action="store_true", help="enable the cascade mechanism")
+
     args = parser.parse_args()
     assert args.heuristic in ['ub0', 'ub1', 'ub2', 'ub0+', 'ub1+', 'ub2+', 'ub4', 'dom']
 
     interval = 1
-    num_points = 25
+    num_points = 1
     start_point = 6
     end_point = start_point + (num_points - 1) * interval
     bds = np.linspace(start=start_point, stop=end_point, num=num_points)
@@ -55,6 +60,7 @@ if __name__ == "__main__":
                 # 💡 极其重要：模型和算法必须在策略循环内全新实例化，防止状态污染
                 model = model_factory.model_factory(args.task, args.num, seed, budget, knap=True)
                 alg = efficient_bfs.EfficientBFS(model)
+                # alg = efficient_bfs.EarlyEfficientBFS(model)
 
                 # 参数配置
                 alg.use_alpha = True
@@ -63,8 +69,10 @@ if __name__ == "__main__":
                 alg.set_d(args.sorting)
                 alg.set_h(heuristic=args.heuristic)
                 alg.setOpt(args.heuristic)
+                alg.inherit_bounds = not args.no_inherit
                 # ... 在实例化 alg 之后 ...
                 alg.use_dive = args.use_dive
+                alg.ub_type = args.heuristic
 
                 # 同样地，把开启了下潜的策略在文件名上标记出来，防止文件覆盖
                 strategy_name_for_file = strategy
@@ -72,6 +80,8 @@ if __name__ == "__main__":
                     strategy_name_for_file += "_LS"
                 if args.use_dive:
                     strategy_name_for_file += "_Dive"
+                if args.no_inherit:
+                    strategy_name_for_file += "_NoInh"  # 标识未开启继承
 
                 # 注入当前循环到的分支策略
                 alg.branching_strategy = strategy
@@ -85,7 +95,10 @@ if __name__ == "__main__":
                 time_cost = res.get('time', 0.0)
                 function_val = res.get('f(S)', 0.0)
                 print(f"trigger count:{res.get('probing_trigger_count', 0)}, depth_list:{res.get('probing_trigger_depth_list', [])}, max_depth:{res.get('max_depth', 0)}")
-                print(f"  ✅ Strategy: {strategy_name_for_file:<14s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | Time: {time_cost:.2f}s")
+                if not res.get('TLE', False):
+                    print(f"  ✅ Strategy: {strategy_name_for_file:<14s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | Time: {time_cost:.2f}s")
+                else:
+                    print(f"  ❌ Strategy: {strategy_name_for_file:<14s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | TLE: {time_cost:.2f}s")
 
                 # 文件保存
                 save_dir = os.path.join(root_dir, args.task, str(args.num), str(seed))

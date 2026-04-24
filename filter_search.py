@@ -1085,7 +1085,7 @@ class EfficientBranchAndBound(OptimalAlg):
 
         self.start_time = 0
         self.TLE = False
-        self.time_limit = 10000
+        self.time_limit = 5000
 
         self.ub_global = 0
 
@@ -1172,7 +1172,6 @@ class EfficientBranchAndBound(OptimalAlg):
             base_set = set(s) | set(c[:i])
             remaining_set = set(t.candidate) - set(c[:i + 1])
             budget_i = t.budget - self.model.cost_of_set(c[:i])
-
             temp = BranchAndBoundNode(list(base_set), list(remaining_set), budget_i)
 
             # 2. Update base incrementally (O(1) overhead) and solve lazily
@@ -1181,9 +1180,9 @@ class EfficientBranchAndBound(OptimalAlg):
 
             current_f = self.model.objective(list(base_set))
 
-            print(f"examing child {temp}, budget_i:{budget_i} candidate:{set(self.model.ground_set) - set(remaining_set)} lbd:{current_f + upper_bound_delta}")
-            if current_f + upper_bound_delta > self.lb_star:
-                print("succeed")
+            # print(f"examing child {temp}, budget_i:{budget_i} candidate:{set(self.model.ground_set) - set(remaining_set)} lbd:{current_f + upper_bound_delta}")
+            if self.alpha * (current_f + upper_bound_delta) > self.lb_star:
+                # print("succeed")
                 children.append(temp)
 
         # 3. Process the final child (including all elements of c)
@@ -1197,9 +1196,9 @@ class EfficientBranchAndBound(OptimalAlg):
         upper_bound_delta_final = opt.solve(remaining_set_final, budget_final)
         current_f_final = self.model.objective(list(base_set_final))
 
-        print(f"examing child {temp}, lbd:{current_f_final + upper_bound_delta_final}")
+        # print(f"examing child {temp}, lbd:{current_f_final + upper_bound_delta_final}")
         if current_f_final + upper_bound_delta_final > self.lb_star:
-            print("succeed")
+            # print("succeed")
             children.append(temp)
 
         return children
@@ -1218,27 +1217,6 @@ class EfficientBranchAndBound(OptimalAlg):
 
         return children
 
-    # def get_children_advance(self, t: BranchAndBoundNode, c):
-    #     children = []
-    #     s = t.s
-    #     for i in range(0, len(c)):
-    #         temp = BranchAndBoundNode(list(set(s) | set(c[:i])), list(set(t.candidate) - set(c[:i + 1])),
-    #                                   t.budget - self.model.cost_of_set(c[:i]))
-    #
-    #         if self.model.objective(list(set(s) | set(c[:i]))) + self.lbd0(list(set(s) | set(c[:i])),
-    #                                                                        list(set(t.candidate) - set(c[:i + 1])),
-    #                                                                        t.budget - self.model.cost_of_set(
-    #                                                                            c[:i])) > self.lb_star:
-    #             children.append(temp)
-    #
-    #     temp = BranchAndBoundNode(list(set(s) | set(c)), list(set(t.candidate) - set(c)),
-    #                               t.budget - self.model.cost_of_set(c))
-    #
-    #     if self.lbd0(list(set(s) | set(c)), list(set(t.candidate) - set(c)),
-    #                  t.budget - self.model.cost_of_set(c)) > self.lb_star:
-    #         children.append(temp)
-    #
-    #     return children
 
     def bab(self, t: BranchAndBoundNode):
         t0 = time.time()
@@ -1279,7 +1257,7 @@ class EfficientBranchAndBound(OptimalAlg):
         while stack:
             # Get the current node
             t = stack.pop()
-            print(f"new node popped:{t}")
+            # print(f"new node popped:{t}")
 
             t0 = time.time()
             # print(f"elas:{t0 -self.start_time}")
@@ -1306,7 +1284,7 @@ class EfficientBranchAndBound(OptimalAlg):
                 self.lb_star = self.g(s_primal)
                 self.s_star = s_primal
 
-            print(f"current lb_star:{self.lb_star}")
+            # print(f"current lb_star:{self.lb_star}")
 
             # 3. Upper Bound Pruning
             ub = f_local
@@ -1333,7 +1311,7 @@ class EfficientBranchAndBound(OptimalAlg):
             # Add children to the stack to be processed in future iterations
             # reverse the children list before adding to stack to maintain the order
             for t_i in reversed(children):
-                print(f"child {t_i} pushed")
+                # print(f"child {t_i} pushed")
                 stack.append(t_i)
 
     def optimize(self):
@@ -1396,7 +1374,7 @@ class EfficientBFS(OptimalAlg):
         final_v = new_g + new_h
 
         v = None
-        print(f"examing node {node.s}, {final_v}, budget:{w}, candidate:{set(self.model.ground_set) - set(candidate)}")
+        # print(f"examing node {node.s}, {final_v}, budget:{w}, candidate:{set(self.model.ground_set) - set(candidate)}")
         if final_v >= s_max_v:
             if self.use_alpha:
                 lbd_v = min(new_g + self.alpha * new_h, lbd_v)
@@ -1408,7 +1386,7 @@ class EfficientBFS(OptimalAlg):
             node.v = v
 
             self.max_heap.push(node)
-            print(f"child {node.s}, {node.v.lbd_v} pushed")
+            # print(f"child {node.s}, {node.v.lbd_v} pushed")
 
             return node
 

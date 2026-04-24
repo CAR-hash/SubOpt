@@ -6,7 +6,6 @@ import random
 import numpy as np
 
 import a_star
-import data_correcting
 import efficient_bfs
 import filter_search
 import id_aster
@@ -36,8 +35,8 @@ if __name__ == "__main__":
     stop_seed = 1
 
     interval = 1
-    num_points = 10
-    start_point = 6
+    num_points = 2
+    start_point = 14
     end_point = start_point + (num_points - 1) * interval
     bds = np.linspace(start=start_point, stop=end_point, num=num_points)
 

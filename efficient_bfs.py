@@ -9,6 +9,19 @@ from base_task import BaseTask
 from filter_search import RefinedBFSValue
 
 
+class TimerProxy:
+    """计时器代理，用于控制循环的生命周期"""
+
+    def __init__(self, timeout_seconds):
+        self.timeout_seconds = timeout_seconds
+        self.start_time = time.time()
+
+    @property
+    def is_active(self):
+        """代理拦截口：未超时返回 True，超时返回 False"""
+        return (time.time() - self.start_time) <= self.timeout_seconds
+
+
 class EfficientBFS(OptimalAlg):
     def __init__(self, model: BaseTask):
         super().__init__(model)
@@ -47,6 +60,25 @@ class EfficientBFS(OptimalAlg):
         self.ema_alpha = 0.15
         self.ema_threshold = 0.05
 
+        self.timer_proxy = None
+
+        # === 继承机制控制器 ===
+        self.inherit_bounds = True  # 默认开启继承
+
+        # === 新增：上界评估器类型 ===
+        self.ub_type = 'ub2'  # 默认使用 Slicing
+        self.use_cascade = False  # 是否开启级联过滤
+
+    def _get_optimizer(self):
+        """根据 ub_type 动态实例化对应的 Lazy Optimizer"""
+        if self.ub_type == 'ub0':
+            return acclerated_upper_bounds.LazyPlainOptimizer(self.model)
+        elif self.ub_type == 'ub2':
+            return acclerated_upper_bounds.LazySlicingOptimizer(self.model)
+        else:
+            # 兼容其他情况，默认回退
+            return acclerated_upper_bounds.LazySlicingOptimizer(self.model)
+
     def build(self):
         if self.heap_class == 'tradition':
             self.max_heap = MaxHeap()
@@ -66,7 +98,7 @@ class EfficientBFS(OptimalAlg):
             self.f = self.f_without_alpha
 
     def push_heap(self, s, lbd_v, visited=False, first_child=False, heuristic_sequence=None, candidate=None, w=None,
-                  s_max_v=0, depth=0, forbidden_sets=None):
+                  s_max_v=0, depth=0, forbidden_sets=None, f_local=float('inf')):
 
         # 1. 统一构建完整的节点
         max_idx = max(s) if len(s) > 0 else 0
@@ -78,29 +110,52 @@ class EfficientBFS(OptimalAlg):
         node.forbidden_sets = forbidden_sets if forbidden_sets is not None else []
 
         new_g = self.g(node)
+
+        # --- 核心逻辑：级联过滤 (Cascading Bounds) ---
+        if self.use_cascade:
+            # 第一段：使用极快的 PlainOptimizer (ub0) 进行初筛
+            opt_fast = acclerated_upper_bounds.LazyPlainOptimizer(self.model)
+            opt_fast.build(base=s, remaining=candidate)
+            h_fast = opt_fast.solve(candidate, node.budget)
+
+            # 初筛剪枝判定 (注意也要考虑 alpha)
+            f_fast = new_g + h_fast
+            if self.alpha * f_fast <= self.g(self.s_max):
+                return None  # 被 ub0 秒杀，节省了计算 ub2 的巨量时间
+
+        # 第二段：初筛没杀掉，或者没开启级联，执行正式评估
         new_h = self.h(node)
         final_v = new_g + new_h
+
+        if min(final_v, f_local) * self.alpha <= self.g(self.s_max):
+            return
 
         # 2. 统一进行界限判定和 Alpha 剪枝
         if final_v >= s_max_v:
             if self.use_alpha:
-                lbd_v = min(new_g + self.alpha * new_h, lbd_v)
-                v = RefinedBFSValue(new_g + self.alpha * new_h, lbd_v, self.d(s))
+                new_ub = new_g + self.alpha * new_h
+                # 根据开关决定是否继承父节点的界限
+                if self.inherit_bounds:
+                    lbd_v = min(new_ub, lbd_v)
+                else:
+                    lbd_v = new_ub
+                v = RefinedBFSValue(new_ub, lbd_v, self.d(s))
             else:
-                lbd_v = min(new_g + new_h, lbd_v)
-                v = RefinedBFSValue(new_g + new_h, lbd_v, self.d(s))
+                new_ub = new_g + new_h
+                if self.inherit_bounds:
+                    lbd_v = min(new_ub, lbd_v)
+                else:
+                    lbd_v = new_ub
+                v = RefinedBFSValue(new_ub, lbd_v, self.d(s))
 
             node.v = v
-
-            # 3. 终极分流：进栈还是进堆？
+            # ====== 就是这里！丢失的入堆/栈逻辑找回 ======
             if getattr(self, 'is_diving', False) and self.current_dive_count < self.dive_max_nodes:
-                # 【下潜模式】：压入 DFS 栈
                 self.dfs_stack.append(node)
             else:
-                # 【正常模式】：压入大根堆
                 self.max_heap.push(node)
-
             return node
+            # =========================================
 
         # 被剪枝，直接丢弃
         return None
@@ -120,7 +175,7 @@ class EfficientBFS(OptimalAlg):
         cur_cost = 0  # Tracks the cost of elements added ON TOP of the base
 
         # Initialize the Lazy Optimizer
-        opt = acclerated_upper_bounds.LazySlicingOptimizer(self.model)
+        opt = self._get_optimizer()
         opt.build(base=base, remaining=remaining_elements)
 
         # Initial upper bound
@@ -135,8 +190,7 @@ class EfficientBFS(OptimalAlg):
             heapq.heappush(h, (-density(e, sol), tie_breaker, e))
             tie_breaker += 1
 
-        while h:
-
+        while self.timer_proxy.is_active and h:
             # 2. Pop the element with the highest upper-bound density
             neg_ds, _, u = heapq.heappop(h)
 
@@ -210,20 +264,19 @@ class EfficientBFS(OptimalAlg):
 
         return root, f_upper, heuristic_sequence, s_max
 
-    def branching(self, node, heuristic_sequence):
+    def branching(self, node, heuristic_sequence, f_local=float('inf')):
         # push first child
         first_ele = heuristic_sequence[0]
         new_candidate = list(set(node.candidate) - {first_ele})
-        # new_lbd = min(node.v.lbd_v, f_local)
         new_lbd = node.v.lbd_v
         open_list_change = 0
 
         # push second child
         self.push_heap(s=node.s, lbd_v=new_lbd, first_child=False,
-                       candidate=new_candidate, w=node.budget, s_max_v=self.g(self.s_max), depth=node.depth + 1)
+                       candidate=new_candidate, w=node.budget, s_max_v=self.g(self.s_max), depth=node.depth + 1,
+                       f_local=f_local)
         open_list_change += 1
 
-        # print(f"current lb_star:{self.g(s_max)}, first ele:{first_ele}, density:{self.model.density(first_ele,s)}")
         if node.cost + self.model.cost_of_singleton(first_ele) <= self.model.budget:
             open_list_change += 1
 
@@ -243,7 +296,6 @@ class EfficientBFS(OptimalAlg):
         """
         if not heuristic_sequence:
             return 0
-
         # 1. 识别高密度簇 (Cluster)
         # 利用你之前的密度跳变思想，找出前几个表现极其接近的“巨头”
         first_d = self.model.marginal_gain(heuristic_sequence[0], node.s) / \
@@ -258,7 +310,6 @@ class EfficientBFS(OptimalAlg):
             else:
                 break
 
-        k = len(cluster)
         open_list_change = 0
         new_lbd = node.v.lbd_v
 
@@ -341,39 +392,186 @@ class EfficientBFS(OptimalAlg):
         new_lbd = node.v.lbd_v
 
         # 3. 提取出高密度冗余簇
-        candidate_T0 = list(set(node.candidate) - set(cluster))
+        # 【修正】根据前缀包含法则，T0 应该是“仅排除老大”，而不是“排除所有人”
+        candidate_T0 = list(set(node.candidate) - {cluster[0]})
 
-        # === T0 预评估 (快速预判切除这 k 个巨头后的后果) ===
+        # === T0 预评估 ===
         ub_T0 = self.g(node.s) + self.fast_evaluate_ub(node.s, candidate_T0, node.budget)
 
         if ub_T0 * self.alpha > self.g(self.s_max):
-            # 熔断保护：T0 杀不死，退化为普通二叉分支
+            # 熔断保护：T0 (即不选老大) 杀不死，退化为普通二叉分支
             return self.branching(node, heuristic_sequence)
         else:
-            # T0 必死！使用 MECE 阶梯分割法完美覆盖剩余空间
-
-            # ⚠️ 倒序循环 (从 k-1 递减到 0)
-            # 先 push 最弱的分支 (沉在栈底)，最后 push 最强的 T_0 分支 (浮在栈顶供 DFS 优先探索)
-            for i in range(k - 1, -1, -1):
+            # T0 必死！说明最优解必然包含老大 cluster[0]。
+            # 接下来用前缀包含法 (10x, 110, 111...) 完美覆盖剩余空间
+            current_s = list(base_set)
+            current_cost = 0
+            branches_to_push = []
+            # 正序构建前缀
+            for i in range(k):
                 target_ele = cluster[i]
+                cost_u = self.model.cost_of_singleton(target_ele)
 
-                if node.budget >= self.model.cost_of_singleton(target_ele):
-                    new_s = list(base_set | {target_ele})
+                if node.budget >= current_cost + cost_u:
+                    # 💡 修正 1：base_set | cluster[:i+1] 的完美实现
+                    current_s.append(target_ele)
+                    current_cost += cost_u
 
-                    # 💡 完备性核心逻辑：
-                    # 当前分支必须排除 cluster 中排在 target_ele 前面的所有元素
-                    # 也就是排除了 cluster[:i]，同时自己 target_ele 被选中了也不在候选集里
-                    # 所以新的候选集 = 原候选集 - cluster[:i+1]
-                    new_candidate_Ti = list(set(node.candidate) - set(cluster[:i + 1]))
-                    self.push_heap(s=new_s, lbd_v=new_lbd, first_child=False,
-                                   heuristic_sequence=None,
-                                   candidate=new_candidate_Ti,
-                                   w=node.budget - self.model.cost_of_singleton(target_ele),
-                                   s_max_v=self.g(self.s_max),
-                                   depth=node.depth + 1)
-                    open_list_change += 1
+                    # 💡 修正 2：排除逻辑
+                    if i < k - 1:
+                        # 状态 10x, 110: 包含了前 i 个，必须明确排除第 i+1 个
+                        new_candidate_Ti = list(set(node.candidate) - set(cluster[:i + 2]))
+                        is_first = False
+                    else:
+                        # 状态 111: 到达前缀末端，全包含，无需额外排除 cluster 内元素
+                        new_candidate_Ti = list(set(node.candidate) - set(cluster))
+                        is_first = True  # 只有全包含才是顺着贪心走的左分支
 
-            return open_list_change
+                    branches_to_push.append({
+                        's': list(current_s),  # 注意拷贝
+                        'candidate': new_candidate_Ti,
+                        'cost': current_cost,
+                        'first_child': is_first
+                    })
+                else:
+                    # 短前缀装不下，长前缀更装不下
+                    break
+
+            # ⚠️ 倒序 push，保证最强的全包含分支 (111) 浮在栈顶供 DFS 优先探索
+            for branch in reversed(branches_to_push):
+                self.push_heap(s=branch['s'],
+                               lbd_v=new_lbd,
+                               first_child=branch['first_child'],
+                               heuristic_sequence=None,
+                               candidate=branch['candidate'],
+                               w=node.budget - branch['cost'],
+                               s_max_v=self.g(self.s_max),
+                               depth=node.depth + 1)
+                open_list_change += 1
+
+        return open_list_change
+
+    def branching_with_binary_collapse(self, node, heuristic_sequence, tau=0.85, f_local=float('inf')):
+        def density(e, s):
+            return self.model.marginal_gain(e, s) / self.model.cost_of_singleton(e)
+
+        def get_top_2_elements(candidate_list, base_set, remaining_budget):
+            """
+            以 O(N) 复杂度扫描候选集，找出当前状态下密度最高的前2个合法元素
+            返回: (e1, d1), (e2, d2)
+            """
+            best_e1, best_e2 = None, None
+            best_d1, best_d2 = -float('inf'), -float('inf')
+
+            # 转换为 list 以匹配你的 model 接口
+            base_list = list(base_set)
+
+            for e in candidate_list:
+                cost = self.model.cost_of_singleton(e)
+
+                # 必须校验容量：装不下的元素直接无视
+                if cost > remaining_budget:
+                    continue
+
+                gain = self.model.marginal_gain(e, base_list)
+                d = gain / cost
+
+                # 擂台法：维护前两大元素
+                if d > best_d1:
+                    # 原来的老大退居老二
+                    best_d2 = best_d1
+                    best_e2 = best_e1
+                    # 新元素上位老大
+                    best_d1 = d
+                    best_e1 = e
+                elif d > best_d2:
+                    # 没打过老大，但打赢了老二，替换老二
+                    best_d2 = d
+                    best_e2 = e
+
+            return best_e1, best_d1, best_e2, best_d2
+
+        # 1. 以 O(N) 极速获取头两号交椅
+        # e1, d1, e2, d2 = get_top_2_elements(node.candidate, node.s, node.budget)
+        e1, e2 = heuristic_sequence[0], heuristic_sequence[1],
+        d1, d2 = density(e1, node.s), density(e2, node.s)
+
+        print(f"examining node:{node.s}, {set(self.model.ground_set) - set(node.candidate)}")
+        print(f"heuristic:{heuristic_sequence[:2]}, e1:{e1}, d1:{d1}, e2:{e2}, d2:{d2}")
+
+        # 极端情况防御：如果没有合法元素，或者只有一个元素，直接正常分支或结束
+        if e1 is None:
+            return
+        if e2 is None or d2 < tau * d1:
+            # 没有老二，或者老二差距太大构不成威胁，退化为普通二叉分支
+            # （你可以调用原来的 self.branching(node, node.heuristic_sequence)）
+            self.branching(node, heuristic_sequence, f_local)
+
+        # ================= 触发双向坍缩 (Double Collapse) =================
+        open_list_change = 0
+        current_lb = self.g(self.s_max)
+        print(f"current_lb:{current_lb}")
+
+        # 默认状态
+        left_base = list(set(node.s) | {e1})
+        left_cand = list(set(node.candidate) - {e1})
+        left_budget = node.budget - self.model.cost_of_singleton(e1)
+
+        right_base = list(node.s)
+        right_cand = list(set(node.candidate) - {e1})
+        right_budget = node.budget
+
+        # --- A. 左分支 Look-ahead 测试 ---
+        # 试探：选 e1，但不选 e2
+        cand_test_left = list(set(node.candidate) - {e1, e2})
+        UB_left_test = self.fast_evaluate_ub(left_base, cand_test_left, left_budget)
+        print(
+            f"base_left:{left_base}, cand_left:{set(self.model.ground_set) - set(cand_test_left)}, b:{left_budget}, UB_left:{UB_left_test}")
+
+        if UB_left_test * self.alpha <= current_lb:
+            # 💥 左坍缩：选了 e1 必须选 e2！
+            if left_budget >= self.model.cost_of_singleton(e2):  # 确保 e2 能装下
+                left_base.append(e2)
+                left_cand.remove(e2)
+                left_budget -= self.model.cost_of_singleton(e2)
+                # print(f"💥 [Left Collapse] {e1} implies {e2}")
+
+        # --- B. 右分支 Look-ahead 测试 ---
+        # 试探：不选 e1，也不选 e2
+        cand_test_right = list(set(node.candidate) - {e1, e2})
+        UB_right_test = self.fast_evaluate_ub(right_base, cand_test_right, right_budget)
+
+        if UB_right_test * self.alpha <= current_lb:
+            # 💥 右坍缩：不选 e1 必须选 e2！
+            if right_budget >= self.model.cost_of_singleton(e2):
+                right_base.append(e2)
+                right_cand.remove(e2)
+                right_budget -= self.model.cost_of_singleton(e2)
+                # print(f"💥 [Right Collapse] NOT {e1} implies {e2}")
+
+        # ================= 入堆 =================
+        # 右分支 (子节点 2)
+        self.push_heap(s=right_base,
+                       lbd_v=node.v.lbd_v,
+                       first_child=False,
+                       candidate=right_cand,
+                       w=right_budget,
+                       s_max_v=current_lb,
+                       depth=node.depth + 1)
+        open_list_change += 1
+
+        # 左分支 (子节点 1)
+        if node.budget >= self.model.cost_of_singleton(e1):
+            self.push_heap(s=left_base,
+                           lbd_v=node.v.lbd_v,
+                           first_child=False,  # 因为发生改变，强制子节点重算序列
+                           candidate=left_cand,
+                           w=left_budget,
+                           s_max_v=current_lb,
+                           depth=node.depth + 1)
+            open_list_change += 1
+
+        return open_list_change
 
     def branching_volume_biased(self, node, heuristic_sequence, top_n=5):
         """
@@ -431,10 +629,7 @@ class EfficientBFS(OptimalAlg):
             # 如果 UB 已经跟 LB 差不多了，哪怕找到“承重墙”也剪不了多少树了
             # 这时候再降级到 m=1 或 m=2
             m = 1
-        """
-        策略 C：探测分支 (Strong Branching / Probing)。
-        对前 top_m 个高密度元素进行剔除模拟，选择能让 UB 降得最低的元素进行分支。
-        """
+
         pool = heuristic_sequence[:top_m]
         if not pool:
             return 0
@@ -514,7 +709,6 @@ class EfficientBFS(OptimalAlg):
 
         # 3. 统计命中情况
         hit_index = pool.index(best_ele)
-
         # ================= 级联 EMA 核心逻辑 =================
         # 批量更新当前活跃的几个 Index 的存活概率
         for i in range(self.m_current):
@@ -564,8 +758,53 @@ class EfficientBFS(OptimalAlg):
 
         return open_list_change
 
+    def branching_naive(self, node, heuristic_sequence=None):
+        """
+        朴素 N 叉分支 (Naive N-ary Branching)
+        将所有可行的元素各自分支，利用前缀排除法避免组合重复。
+        用于作为 Baseline 展示二元/高级分支策略的性能优势。
+        """
+        open_list_change = 0
+        base_set = list(node.s)
+        candidates = list(node.candidate)
+
+        if not candidates:
+            return 0
+
+        # 按边际收益密度对候选集进行降序排序
+        candidates.sort(
+            key=lambda x: self.model.marginal_gain(x, base_set) / self.model.cost_of_singleton(x),
+            reverse=True
+        )
+
+        new_lbd = node.v.lbd_v
+
+        # 💡 倒序遍历入堆：保证最高密度的分支最后入栈 (栈顶)，适配 DFS 下潜
+        for i in reversed(range(len(candidates))):
+            target_ele = candidates[i]
+            cost_u = self.model.cost_of_singleton(target_ele)
+
+            # 校验背包容量
+            if node.budget >= cost_u:
+                new_s = list(set(base_set) | {target_ele})
+                # 排除当前元素及排在它前面的所有元素，避免重复遍历
+                new_candidate = list(set(node.candidate) - set(candidates[:i + 1]))
+
+                self.push_heap(s=new_s,
+                               lbd_v=new_lbd,
+                               first_child=False,  # 朴素分支强制子节点重算启发式序列
+                               heuristic_sequence=None,
+                               candidate=new_candidate,
+                               w=node.budget - cost_u,
+                               s_max_v=self.g(self.s_max),
+                               depth=node.depth + 1)
+                open_list_change += 1
+
+        return open_list_change
+
     def optimize(self):
         start_time = time.time()
+        self.timer_proxy = TimerProxy(timeout_seconds=5000)
 
         root, f_upper, heuristic_sequence, self.s_max = self.push_root()
 
@@ -584,13 +823,12 @@ class EfficientBFS(OptimalAlg):
         node_count = 0
         open_list_count = 1
 
-        while self.max_heap.size() > 0 or len(self.dfs_stack) > 0:
-            # ================= 节点弹出逻辑 (双引擎切换) =================
+        while self.timer_proxy.is_active and self.max_heap.size() > 0 or len(self.dfs_stack) > 0:
+            # ================= 节点弹出逻辑 =================
             if len(self.dfs_stack) > 0:
                 # 引擎 A：DFS 下潜模式
                 node = self.dfs_stack.pop()
                 self.current_dive_count += 1
-
                 # 如果下潜探索的节点数达到上限，强制结束本次下潜
                 if self.current_dive_count >= self.dive_max_nodes:
                     # 把栈里剩下的节点全部“倒回”全局大根堆，防止解空间丢失
@@ -598,12 +836,10 @@ class EfficientBFS(OptimalAlg):
                         self.max_heap.push(remaining_node)  # 用你原有的入堆方法
                     self.dfs_stack.clear()
                     self.is_diving = False
-                    # print("🛬 [DIVE] Max depth reached. Surfacing to BFS...")
             else:
                 # 引擎 B：正常的 BFS 模式
                 node = self.max_heap.pop()
                 node_count += 1
-
                 # 触发判定：是否到了该下潜的时候？
                 if getattr(self, 'use_dive', False) and node_count > 0 and node_count % self.dive_interval == 0:
                     self.is_diving = True
@@ -618,24 +854,16 @@ class EfficientBFS(OptimalAlg):
 
             # 只有未访问过的节点需要评估
             if not node.visited:
-                safety_margin = 1.05
-                is_safe = (node.v.lbd_v * self.alpha > self.g(self.s_max) * safety_margin)
                 has_legacy = (node.heuristic_sequence is not None and len(node.heuristic_sequence) > 0)
-
-                # 左分支直接沿用老路，绝对不跑 greedy_add
+                # 左分支沿用老路
                 if node.first_child and has_legacy:
                     f_local = node.v.lbd_v
                     heuristic_sequence = node.heuristic_sequence
-
-                # 右分支虽然偏离轨道，但如果上界看起来很高，懒得去精确计算，直接放行
-                elif not node.first_child and is_safe and has_legacy:
-                    f_local = node.v.lbd_v
-                    heuristic_sequence = node.heuristic_sequence
-
-                # 🛑 只有一种情况跑 greedy_add：
-                # 右分支（或根节点）且上界逼近危险区！必须重算精确上界进行剪杀，或寻找新的 s_max 路线。
+                # 右分支重新计算
                 else:
                     s_final, f_local, heuristic_sequence = self.greedy_add(node)
+                    if not self.timer_proxy.is_active:
+                        break
                     f_upper = min(f_upper, node.v.lbd_v)
 
                     # --- 更新全局最优 LB ---
@@ -650,40 +878,9 @@ class EfficientBFS(OptimalAlg):
                                 self.s_max = enhanced_s
                                 print(f"🚀 [LS Hit] Improved global LB to {enhanced_val:.2f}")
 
-                if min(node.v.lbd_v, f_local) * self.alpha <= self.g(self.s_max):
+                if self.branching_strategy != 'fullbab' and min(node.v.lbd_v, f_local) * self.alpha <= self.g(
+                        self.s_max):
                     continue
-
-            # f_local, heuristic_sequence = node.v.lbd_v, None
-            # if not node.visited and not node.first_child:
-            #     s_final, f_local, heuristic_sequence = self.greedy_add(node)
-            #     # node.v.lbd_v = min(node.v.lbd_v, f_local)
-            #     f_upper = min(f_upper, node.v.lbd_v)
-            #
-            #     if self.g(s_final) > self.g(self.s_max):
-            #         self.s_max = s_final
-            #
-            #     if self.local_search:
-            #         if self.g(s_final) > 0.98 * self.g(self.s_max):
-            #             # enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, node.candidate)
-            #             # ✅ 修改为 self.model.ground_set
-            #             # enhanced_s, enhanced_val = self.fast_local_swap(self.s_max, self.model.ground_set)
-            #             enhanced_s, enhanced_val = self.fast_local_swap_hs(self.s_max, heuristic_sequence)
-            #             if enhanced_val > self.g(self.s_max):
-            #                 self.s_max = enhanced_s
-            #                 print(f"LS improved LB to {enhanced_val:.2f}")
-            #         # print(f"s_max updated:{self.s_max}, early pruning:{min(node.v.lbd_v, f_local) * self.alpha}")
-            #
-            #     if min(node.v.lbd_v, f_local) * self.alpha <= self.g(self.s_max):
-            #         continue
-            #
-            #     if self.use_alpha:
-            #         if self.g(self.s_max) >= f_upper:
-            #             sol = self.s_max
-            #             break
-            #     else:
-            #         if self.g(self.s_max) >= self.alpha * f_upper:
-            #             sol = self.s_max
-            #             break
 
             if node.visited or node.first_child:
                 heuristic_sequence = node.heuristic_sequence
@@ -694,21 +891,21 @@ class EfficientBFS(OptimalAlg):
             # ================= 对比实验开关 =================
             if self.branching_strategy == "traditional":
                 # 策略 A: 传统二元分支
+                self.branching(node, heuristic_sequence, f_local=f_local)
+            elif self.branching_strategy == "fullbab":
+                # 策略 A: 传统二元分支
                 self.branching(node, heuristic_sequence)
-
             elif self.branching_strategy == "density_gap":
                 # 策略 D: 密度跳变多叉分支
                 self.recursive_branching(node, heuristic_sequence, tau=0.8, max_k=4)
-
             elif self.branching_strategy == 'volume_biased':
                 self.branching_volume_biased(node, heuristic_sequence, top_n=5)
-
             elif self.branching_strategy == 'probing':
                 self.branching_probing(node, heuristic_sequence)
-
-            elif self.branching_strategy == 'injection':
-                self.branching_with_injection(node, heuristic_sequence)
-
+            elif self.branching_strategy == 'binary_collapse':
+                self.branching_with_binary_collapse(node, heuristic_sequence, f_local)
+            if self.branching_strategy == "naive":
+                self.branching_naive(node, heuristic_sequence)
             # ================================================
 
         stop_time = time.time()
@@ -716,8 +913,10 @@ class EfficientBFS(OptimalAlg):
         assert sol is not None, "No solution found."
 
         ret = {'S': sol, 'c(S)': self.model.cost_of_set(sol), 'f(S)': self.model.objective(sol),
-               'time': stop_time - start_time, 'node_count': node_count, "open_list_count": open_list_count, 'probing_trigger_count': self.probing_trigger_count,
-               'probing_trigger_depth_list': self.probing_trigger_depth_list, 'max_depth': self.max_depth}
+               'time': stop_time - start_time, 'node_count': node_count, "open_list_count": open_list_count,
+               'probing_trigger_count': self.probing_trigger_count,
+               'probing_trigger_depth_list': self.probing_trigger_depth_list, 'max_depth': self.max_depth,
+               "TLE": not self.timer_proxy.is_active}
 
         return ret
 
@@ -795,3 +994,4 @@ class EfficientBFS(OptimalAlg):
 
         # 如果遍历完截断的候选集都没有发现任何提升，原样返回
         return best_sol, best_val
+
