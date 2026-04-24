@@ -111,7 +111,6 @@ class EfficientBFS(OptimalAlg):
 
         new_g = self.g(node)
 
-
         # --- 核心逻辑：级联过滤 (Cascading Bounds) ---
         if self.use_cascade:
             # 第一段：使用极快的 PlainOptimizer (ub0) 进行初筛
@@ -618,6 +617,7 @@ class EfficientBFS(OptimalAlg):
         # 扫描前 15 个高密度元素，揪出所有 e1 的“寄生克隆体”
         # ==========================================================
         removed_clones_count = 0
+        removed_clones = []
         scan_limit = min(15, len(heuristic_sequence))  # 视野扩大到前 15 名
 
         for i in range(1, scan_limit):
@@ -642,11 +642,16 @@ class EfficientBFS(OptimalAlg):
 
             # ====== 放宽判定并强制输出分析日志 ======
             if d_new < 0.8 * d_orig:  # 只要衰减了 20% 就视为互相牵制
-                left_cand.remove(e_test)
+                # left_cand.remove(e_test)
+                removed_clones.append(e_test)
                 removed_clones_count += 1
-                if node.depth < 3:  # 看看前几层到底发生了什么
-                    print(
-                        f"[Analysis] {e1} 压制了 {e_test}: 初始密度 {d_orig:.2f} -> 跌至 {d_new:.2f} (保留率 {d_new / d_orig * 100:.1f}%)")
+
+            # ==========================================================
+            # 💥 核心杀招：左侧互斥，右侧破缺 (Symmetry Breaking)
+            # ==========================================================
+            for clone in removed_clones:
+                left_cand.remove(clone)  # 左分支：选了 e1，就不选克隆体 (互斥)
+                right_cand.remove(clone)  # 右分支：连 e1 都不选，更不可能选它的克隆体 (对称性破缺)
 
         # ====== 插入点 1：监测坍缩命中情况 ======
         if removed_clones_count > 0 and node.depth < 5:
@@ -734,15 +739,6 @@ class EfficientBFS(OptimalAlg):
         return open_list_change
 
     def branching_probing(self, node, heuristic_sequence, top_m=3):
-        # 只要当前的 UB 距离我们手里握着的全局 LB 还有一段距离
-        # 就说明这棵树还有很大的剪枝潜力，不要心疼算力，老老实实火力全开 (m=3) 去排雷
-        if node.v.lbd_v > 1.1 * self.g(self.s_max):
-            m = 3
-        else:
-            # 如果 UB 已经跟 LB 差不多了，哪怕找到“承重墙”也剪不了多少树了
-            # 这时候再降级到 m=1 或 m=2
-            m = 1
-
         pool = heuristic_sequence[:top_m]
         if not pool:
             return 0
@@ -799,6 +795,7 @@ class EfficientBFS(OptimalAlg):
                            depth=node.depth + 1)
 
         return open_list_change
+
 
     def branching_probing_adapt(self, node, heuristic_sequence):
         if self.m_current == 1:

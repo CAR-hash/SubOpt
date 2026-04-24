@@ -44,6 +44,7 @@ class EfficientBFSHeapObj(HeapObj):
         self.depth = depth
         self.forbidden_sets = forbidden_sets if forbidden_sets is not None else []
 
+
 class BranchAndBoundNode(HeapObj):
     # s: current set
     # c: candidate set
@@ -220,3 +221,5 @@ class SimpleMaxHeap(object):
 
     def size(self):
         return len(self.h)
+
+
