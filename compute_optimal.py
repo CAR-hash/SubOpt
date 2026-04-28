@@ -2,6 +2,9 @@ import argparse
 import os
 import pickle
 import random
+import sys
+
+import testlogger
 
 import numpy as np
 
@@ -35,8 +38,8 @@ if __name__ == "__main__":
     stop_seed = 1
 
     interval = 1
-    num_points = 2
-    start_point = 14
+    num_points = 1
+    start_point = 6
     end_point = start_point + (num_points - 1) * interval
     bds = np.linspace(start=start_point, stop=end_point, num=num_points)
 
@@ -44,6 +47,10 @@ if __name__ == "__main__":
 
     for seed in range(start_seed, stop_seed):
         for budget in bds:
+            log_dir = f"./result/archive-{args.archive}/{args.task}/"
+            os.makedirs(log_dir, exist_ok=True)
+            sys.stdout = testlogger.TeeLogger(os.path.join(log_dir, f"{args.algorithm}_{budget}_log.txt"))
+
             for ub in ub_list:
                 for d in d_list:
                     random.seed(seed)

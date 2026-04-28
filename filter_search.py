@@ -1180,10 +1180,18 @@ class EfficientBranchAndBound(OptimalAlg):
 
             current_f = self.model.objective(list(base_set))
 
+            node_ub = current_f + upper_bound_delta
             # print(f"examing child {temp}, budget_i:{budget_i} candidate:{set(self.model.ground_set) - set(remaining_set)} lbd:{current_f + upper_bound_delta}")
-            if self.alpha * (current_f + upper_bound_delta) > self.lb_star:
+            if self.alpha * node_ub > self.lb_star:
                 # print("succeed")
+                # ====== 全透视追踪 5：生成子节点 ======
+                print(f"      ├── 🌿 [BRANCH] 生成子节点 S: {list(base_set)} | 排除: {c[i]} | UB: {node_ub:.4f}")
+                # ====================================
                 children.append(temp)
+            else:
+                # ====== 全透视追踪 6：子节点流产 ======
+                print(f"      ├── ✂️ [PRUNED] 丢弃子节点 S: {list(base_set)} | 排除: {c[i]} | UB: {node_ub:.4f} <= LB")
+                # ====================================
 
         # 3. Process the final child (including all elements of c)
         base_set_final = set(s) | set(c)
@@ -1267,6 +1275,12 @@ class EfficientBranchAndBound(OptimalAlg):
 
             self.node_count += 1
 
+            # ====== 全透视追踪 1：节点弹出 ======
+            print(
+                f"\n🟢 [POP] Node #{self.node_count} | Stack剩余: {len(stack)} | Cost: {self.model.cost_of_set(t.s):.2f}/{self.model.budget}")
+            print(f"   => 当前集合 S: {t.s}")
+            # ====================================
+
             # 1. Pruning/Base Case Checks
             if len(t.candidate) == 0:
                 continue
@@ -1279,6 +1293,16 @@ class EfficientBranchAndBound(OptimalAlg):
 
             if self.TLE:
                 return
+
+            # ====== 全透视追踪 2：LB 更新 ======
+            if self.g(s_primal) > self.lb_star:
+                print(
+                    f"   ├── 🌟 [LB 突破!] 发现新全局最优解! 收益: {self.g(s_primal):.4f} (原为 {self.lb_star:.4f})")
+                self.lb_star = self.g(s_primal)
+
+            print(
+                f"   ├── [EVAL] 启发序列 c 长度: {len(c)} | 局部上限(UB): {f_local:.4f} | 当前最优 LB: {self.lb_star:.4f}")
+            # ====================================
 
             if self.g(s_primal) > self.lb_star:
                 self.lb_star = self.g(s_primal)
@@ -1293,9 +1317,16 @@ class EfficientBranchAndBound(OptimalAlg):
             #     self.time_for_stage_0 += time.time() - t0
             #     continue
             if self.alpha * ub <= self.lb_star:
+                # ====== 全透视追踪 3：节点被剪 ======
+                print(f"   └── ❌ [KILLED] 剪枝生效! 节点已被抹杀。")
+                # ====================================
                 # Update timing before continuing to next node
                 self.time_for_stage_0 += time.time() - t0
                 continue
+
+            # ====== 全透视追踪 4：节点存活 ======
+            print(f"   └── ✅ [SURVIVED] 界限达标，准备展开多叉分支...")
+            # ====================================
 
             t1 = time.time()
 

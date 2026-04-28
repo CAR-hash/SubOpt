@@ -2,6 +2,9 @@ import argparse
 import os
 import pickle
 import random
+import sys
+
+import testlogger
 
 import numpy as np
 
@@ -53,6 +56,10 @@ if __name__ == "__main__":
 
             # 最内层循环：遍历所有指定的分支策略
             for strategy in args.branching:
+                log_dir = f"./result/archive-{args.archive}/{args.task}/"
+                os.makedirs(log_dir, exist_ok=True)
+                sys.stdout = testlogger.TeeLogger(os.path.join(log_dir, f"{strategy}_{budget}_log.txt"))
+
                 # 💡 极其重要：随机数种子必须在这里重置！
                 # 确保同一个 seed+budget 下，不管跑哪个策略，底层的随机生成序列完全一致
                 random.seed(seed)

@@ -460,127 +460,85 @@ class EfficientBFS(OptimalAlg):
 
         return open_list_change
 
-    # def branching_with_binary_collapse(self, node, heuristic_sequence, tau=0.85, f_local=float('inf')):
-    #     def density(e, s):
-    #         return self.model.marginal_gain(e, s) / self.model.cost_of_singleton(e)
-    #
-    #     def get_top_2_elements(candidate_list, base_set, remaining_budget):
-    #         """
-    #         以 O(N) 复杂度扫描候选集，找出当前状态下密度最高的前2个合法元素
-    #         返回: (e1, d1), (e2, d2)
-    #         """
-    #         best_e1, best_e2 = None, None
-    #         best_d1, best_d2 = -float('inf'), -float('inf')
-    #
-    #         # 转换为 list 以匹配你的 model 接口
-    #         base_list = list(base_set)
-    #
-    #         for e in candidate_list:
-    #             cost = self.model.cost_of_singleton(e)
-    #
-    #             # 必须校验容量：装不下的元素直接无视
-    #             if cost > remaining_budget:
-    #                 continue
-    #
-    #             gain = self.model.marginal_gain(e, base_list)
-    #             d = gain / cost
-    #
-    #             # 擂台法：维护前两大元素
-    #             if d > best_d1:
-    #                 # 原来的老大退居老二
-    #                 best_d2 = best_d1
-    #                 best_e2 = best_e1
-    #                 # 新元素上位老大
-    #                 best_d1 = d
-    #                 best_e1 = e
-    #             elif d > best_d2:
-    #                 # 没打过老大，但打赢了老二，替换老二
-    #                 best_d2 = d
-    #                 best_e2 = e
-    #
-    #         return best_e1, best_d1, best_e2, best_d2
-    #
-    #     # 1. 以 O(N) 极速获取头两号交椅
-    #     # e1, d1, e2, d2 = get_top_2_elements(node.candidate, node.s, node.budget)
-    #     e1, e2 = heuristic_sequence[0], heuristic_sequence[1],
-    #     d1, d2 = density(e1, node.s), density(e2, node.s)
-    #
-    #     # print(f"examining node:{node.s}, {set(self.model.ground_set) - set(node.candidate)}")
-    #     # print(f"heuristic:{heuristic_sequence[:2]}, e1:{e1}, d1:{d1}, e2:{e2}, d2:{d2}")
-    #
-    #     # 极端情况防御：如果没有合法元素，或者只有一个元素，直接正常分支或结束
-    #     if e1 is None:
-    #         return
-    #     if e2 is None or d2 < tau * d1:
-    #         # 没有老二，或者老二差距太大构不成威胁，退化为普通二叉分支
-    #         # （你可以调用原来的 self.branching(node, node.heuristic_sequence)）
-    #         self.branching(node, heuristic_sequence, f_local)
-    #
-    #     # ================= 触发双向坍缩 (Double Collapse) =================
-    #     open_list_change = 0
-    #     current_lb = self.g(self.s_max)
-    #     print(f"current_lb:{current_lb}")
-    #
-    #     # 默认状态
-    #     left_base = list(set(node.s) | {e1})
-    #     left_cand = list(set(node.candidate) - {e1})
-    #     left_budget = node.budget - self.model.cost_of_singleton(e1)
-    #
-    #     right_base = list(node.s)
-    #     right_cand = list(set(node.candidate) - {e1})
-    #     right_budget = node.budget
-    #
-    #     # --- A. 左分支 Look-ahead 测试 ---
-    #     # 试探：选 e1，但不选 e2
-    #     cand_test_left = list(set(node.candidate) - {e1, e2})
-    #     UB_left_test = self.fast_evaluate_ub(left_base, cand_test_left, left_budget)
-    #     print(
-    #         f"base_left:{left_base}, cand_left:{set(self.model.ground_set) - set(cand_test_left)}, b:{left_budget}, UB_left:{UB_left_test}")
-    #
-    #     if UB_left_test * self.alpha <= current_lb:
-    #         # 💥 左坍缩：选了 e1 必须选 e2！
-    #         if left_budget >= self.model.cost_of_singleton(e2):  # 确保 e2 能装下
-    #             left_base.append(e2)
-    #             left_cand.remove(e2)
-    #             left_budget -= self.model.cost_of_singleton(e2)
-    #             # print(f"💥 [Left Collapse] {e1} implies {e2}")
-    #
-    #     # --- B. 右分支 Look-ahead 测试 ---
-    #     # 试探：不选 e1，也不选 e2
-    #     cand_test_right = list(set(node.candidate) - {e1, e2})
-    #     UB_right_test = self.fast_evaluate_ub(right_base, cand_test_right, right_budget)
-    #
-    #     if UB_right_test * self.alpha <= current_lb:
-    #         # 💥 右坍缩：不选 e1 必须选 e2！
-    #         if right_budget >= self.model.cost_of_singleton(e2):
-    #             right_base.append(e2)
-    #             right_cand.remove(e2)
-    #             right_budget -= self.model.cost_of_singleton(e2)
-    #             # print(f"💥 [Right Collapse] NOT {e1} implies {e2}")
-    #
-    #     # ================= 入堆 =================
-    #     # 右分支 (子节点 2)
-    #     self.push_heap(s=right_base,
-    #                    lbd_v=node.v.lbd_v,
-    #                    first_child=False,
-    #                    candidate=right_cand,
-    #                    w=right_budget,
-    #                    s_max_v=current_lb,
-    #                    depth=node.depth + 1)
-    #     open_list_change += 1
-    #
-    #     # 左分支 (子节点 1)
-    #     if node.budget >= self.model.cost_of_singleton(e1):
-    #         self.push_heap(s=left_base,
-    #                        lbd_v=node.v.lbd_v,
-    #                        first_child=False,  # 因为发生改变，强制子节点重算序列
-    #                        candidate=left_cand,
-    #                        w=left_budget,
-    #                        s_max_v=current_lb,
-    #                        depth=node.depth + 1)
-    #         open_list_change += 1
-    #
-    #     return open_list_change
+    def branching_binary_collapse(self, node, heuristic_sequence, tau=0.85, f_local=float('inf')):
+        def density(e, s):
+            return self.model.marginal_gain(e, s) / self.model.cost_of_singleton(e)
+
+        e1, e2 = heuristic_sequence[0], heuristic_sequence[1],
+        d1, d2 = density(e1, node.s), density(e2, node.s)
+
+        # 极端情况防御：如果没有合法元素，或者只有一个元素，直接正常分支或结束
+        if e1 is None:
+            return
+        # if e2 is None or d2 < tau * d1:
+        #     # 没有老二，或者老二差距太大构不成威胁，退化为普通二叉分支
+        #     self.branching(node, heuristic_sequence, f_local)
+        if e2 is None:
+            # 没有老二，退化为普通二叉分支
+            self.branching(node, heuristic_sequence, f_local)
+
+        # ================= 触发双向坍缩 (Double Collapse) =================
+        open_list_change = 0
+        current_lb = self.g(self.s_max)
+
+        # 默认状态
+        left_base = list(set(node.s) | {e1})
+        left_cand = list(set(node.candidate) - {e1})
+        left_budget = node.budget - self.model.cost_of_singleton(e1)
+
+        right_base = list(node.s)
+        right_cand = list(set(node.candidate) - {e1})
+        right_budget = node.budget
+
+        # --- A. 左分支 Look-ahead 测试 ---
+        # 试探：选 e1，但不选 e2
+        cand_test_left = list(set(node.candidate) - {e1, e2})
+        UB_left_test = self.fast_evaluate_ub(left_base, cand_test_left, left_budget)
+
+        if UB_left_test * self.alpha <= current_lb:
+            # 💥 左坍缩：选了 e1 必须选 e2！
+            if left_budget >= self.model.cost_of_singleton(e2):  # 确保 e2 能装下
+                left_base.append(e2)
+                left_cand.remove(e2)
+                left_budget -= self.model.cost_of_singleton(e2)
+                # print(f"💥 [Left Collapse] {e1} implies {e2}")
+
+        # --- B. 右分支 Look-ahead 测试 ---
+        # 试探：不选 e1，也不选 e2
+        cand_test_right = list(set(node.candidate) - {e1, e2})
+        UB_right_test = self.fast_evaluate_ub(right_base, cand_test_right, right_budget)
+
+        if UB_right_test * self.alpha <= current_lb:
+            # 💥 右坍缩：不选 e1 必须选 e2！
+            if right_budget >= self.model.cost_of_singleton(e2):
+                right_base.append(e2)
+                right_cand.remove(e2)
+                right_budget -= self.model.cost_of_singleton(e2)
+                # print(f"💥 [Right Collapse] NOT {e1} implies {e2}")
+
+        # ================= 入堆 =================
+        # 右分支 (子节点 2)
+        self.push_heap(s=right_base,
+                       lbd_v=node.v.lbd_v,
+                       first_child=False,
+                       candidate=right_cand,
+                       w=right_budget,
+                       s_max_v=current_lb,
+                       depth=node.depth + 1)
+        open_list_change += 1
+
+        # 左分支 (子节点 1)
+        if node.budget >= self.model.cost_of_singleton(e1):
+            self.push_heap(s=left_base,
+                           lbd_v=node.v.lbd_v,
+                           first_child=False,  # 因为发生改变，强制子节点重算序列
+                           candidate=left_cand,
+                           w=left_budget,
+                           s_max_v=current_lb,
+                           depth=node.depth + 1)
+            open_list_change += 1
+
+        return open_list_change
 
     def branching_cluster_collapse(self, node, heuristic_sequence, tau=0.85):
         """
@@ -1026,8 +984,10 @@ class EfficientBFS(OptimalAlg):
                 self.branching_probing(node, heuristic_sequence)
             elif self.branching_strategy == 'cluster_collapse':
                 self.branching_cluster_collapse(node, heuristic_sequence, f_local)
-            if self.branching_strategy == "naive":
+            elif self.branching_strategy == "naive":
                 self.branching_naive(node, heuristic_sequence)
+            elif self.branching_strategy == 'binary_collapse':
+                self.branching_binary_collapse(node, heuristic_sequence, f_local=f_local)
             # ================================================
 
         stop_time = time.time()
