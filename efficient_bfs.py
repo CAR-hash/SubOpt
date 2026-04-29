@@ -124,7 +124,10 @@ class EfficientBFS(OptimalAlg):
                 return None  # 被 ub0 秒杀，节省了计算 ub2 的巨量时间
 
         # 第二段：初筛没杀掉，或者没开启级联，执行正式评估
+        t_start_h = time.perf_counter()  # 添加开始
         new_h = self.h(node)
+        t_end_h = time.perf_counter()  # 添加结束
+        print(f"[Timer] push_heap -> self.h(node) 耗时: {t_end_h - t_start_h:.6f}s")  # 添加输出
         final_v = new_g + new_h
 
         # ====== 全透视追踪：界限评估 ======
@@ -263,7 +266,11 @@ class EfficientBFS(OptimalAlg):
         root.forbidden_sets = []
 
         f_upper = self.f(root)
+
+        t_start_root = time.perf_counter()
         s_max, f_local, heuristic_sequence = self.greedy_add(root)
+        t_end_root = time.perf_counter()
+        print(f"[Timer] 首次 greedy_add 耗时: {t_end_root - t_start_root:.6f}s")
 
         v = RefinedBFSValue(self.f(root), f_upper, self.d(root.s))
         root.v = v
@@ -288,7 +295,6 @@ class EfficientBFS(OptimalAlg):
 
         if node.cost + self.model.cost_of_singleton(first_ele) <= self.model.budget:
             open_list_change += 1
-
             new_heuristic_sequence = copy.deepcopy(heuristic_sequence)
             new_heuristic_sequence.pop(0)
 
@@ -298,6 +304,96 @@ class EfficientBFS(OptimalAlg):
                            w=node.budget - self.model.cost_of_singleton(first_ele), s_max_v=self.g(self.s_max))
 
         return open_list_change
+
+    def branching_lazy_binary(self, node, heuristic_sequence):
+        """
+        基于惰性评估 (Lazy Evaluation) 的极速双叉分支 (带全透视日志)
+        """
+        if not heuristic_sequence:
+            return 0
+
+        e1 = heuristic_sequence[0]
+        cost_e1 = self.model.cost_of_singleton(e1)
+        current_lb = self.g(self.s_max)
+        open_list_change = 0
+
+        # 1. 初始化惰性评估器 (继承父节点状态)
+        t_start_lazy_build = time.perf_counter()  # 添加开始
+        opt = acclerated_upper_bounds.LazyPlainOptimizer(self.model)
+        opt.build(base=set(node.s), remaining=set(node.candidate))
+        t_end_lazy_build = time.perf_counter()  # 添加结束
+        print(f"[Timer] lazy_binary -> opt.build 耗时: {t_end_lazy_build - t_start_lazy_build:.6f}s")  # 添加输出
+
+        # ==========================================================
+        # A. 右分支 (不选 e1)
+        # ==========================================================
+        right_cand = list(set(node.candidate) - {e1})
+        t_start_lazy_solve_r = time.perf_counter()  # 添加开始
+        ub_delta_right = opt.solve(remaining_set=set(right_cand), budget=node.budget)
+        ub_right = self.model.objective(node.s) + ub_delta_right
+        t_end_lazy_solve_r = time.perf_counter()  # 添加结束
+        print(
+            f"[Timer] lazy_binary -> opt.solve (右分支) 耗时: {t_end_lazy_solve_r - t_start_lazy_solve_r:.6f}s")  # 添加输出
+
+        if self.alpha * ub_right > current_lb:
+            print(f"      ├── 🌿 [BRANCH] 生成右分支(不选) S: {list(node.s)} | 排除: {e1} | UB: {ub_right:.4f}")
+            self.push_heap_with_ub(s=list(node.s),
+                                   candidate=right_cand,
+                                   w=node.budget,
+                                   depth=node.depth + 1,
+                                   pre_computed_ub=ub_right)
+            open_list_change += 1
+        else:
+            print(f"      ├── ✂️ [PRUNED] 丢弃右分支(不选) S: {list(node.s)} | 排除: {e1} | UB: {ub_right:.4f} <= LB")
+
+        # ==========================================================
+        # B. 左分支 (选 e1)
+        # ==========================================================
+        if node.budget >= cost_e1:
+            left_s = list(set(node.s) | {e1})
+            left_cand = list(set(node.candidate) - {e1})
+            left_budget = node.budget - cost_e1
+
+            # 【极速 O(1) 增量】
+            opt.update_base(set(left_s))
+            ub_delta_left = opt.solve(remaining_set=set(left_cand), budget=left_budget)
+            ub_left = self.model.objective(left_s) + ub_delta_left
+
+            if self.alpha * ub_left > current_lb:
+                print(f"      ├── 🌿 [BRANCH] 生成左分支(选入) S: {left_s} | 新增: {e1} | UB: {ub_left:.4f}")
+                self.push_heap_with_ub(s=left_s,
+                                       candidate=left_cand,
+                                       w=left_budget,
+                                       depth=node.depth + 1,
+                                       pre_computed_ub=ub_left,
+                                       heuristic_sequence=heuristic_sequence[1:])
+                open_list_change += 1
+            else:
+                print(f"      ├── ✂️ [PRUNED] 丢弃左分支(选入) S: {left_s} | 新增: {e1} | UB: {ub_left:.4f} <= LB")
+
+        return open_list_change
+
+    def push_heap_with_ub(self, s, candidate, w, depth, pre_computed_ub, heuristic_sequence=None):
+        """
+        专为惰性评估设计的入堆方法。
+        直接接收算好的上界，绝对不再调用昂贵的 self.h() 重算。
+        """
+        node = EfficientBFSHeapObj(
+            s=s,
+            candidate=candidate,
+            w=w,
+            visited=False,
+            max_idx=0
+        )
+        v = RefinedBFSValue(pre_computed_ub, pre_computed_ub, self.d(s))
+        # 强行注入预先算好的极速上界
+        node.v = v
+        node.cost = self.model.budget - w
+        node.depth = depth
+        node.heuristic_sequence = heuristic_sequence
+
+        # 直接推入你重写过容差比较逻辑的 SimpleMaxHeap
+        self.max_heap.push(node)
 
     def branching_with_injection(self, node, heuristic_sequence, tau=0.85, max_k=3):
         """
@@ -649,6 +745,7 @@ class EfficientBFS(OptimalAlg):
             open_list_change += 1
 
         return open_list_change
+    
     def branching_volume_biased(self, node, heuristic_sequence, top_n=5):
         """
         策略 B：大体积优先。
@@ -753,8 +850,6 @@ class EfficientBFS(OptimalAlg):
                            depth=node.depth + 1)
 
         return open_list_change
-
-
     def branching_probing_adapt(self, node, heuristic_sequence):
         if self.m_current == 1:
             return self.branching(node, heuristic_sequence)
@@ -874,7 +969,10 @@ class EfficientBFS(OptimalAlg):
         start_time = time.time()
         self.timer_proxy = TimerProxy(timeout_seconds=5000)
 
+        t_start_root = time.perf_counter()
         root, f_upper, heuristic_sequence, self.s_max = self.push_root()
+        t_end_root = time.perf_counter()
+        print(f"[Timer] push_root (含首次 greedy_add) 耗时: {t_end_root - t_start_root:.6f}s")
 
         # check if s_max now is an optimal solution
         if self.g(self.s_max) >= self.alpha * f_upper:
@@ -937,7 +1035,13 @@ class EfficientBFS(OptimalAlg):
                     heuristic_sequence = node.heuristic_sequence
                 # 右分支重新计算
                 else:
+                    t_start_greedy = time.perf_counter()  # 添加开始
+
                     s_final, f_local, heuristic_sequence = self.greedy_add(node)
+
+                    t_end_greedy = time.perf_counter()  # 添加结束
+                    print(f"[Timer] greedy_add 耗时: {t_end_greedy - t_start_greedy:.6f}s")  # 添加输出
+
                     if not self.timer_proxy.is_active:
                         break
                     f_upper = min(f_upper, node.v.lbd_v)
@@ -969,6 +1073,8 @@ class EfficientBFS(OptimalAlg):
                 continue
 
             # ================= 对比实验开关 =================
+            t_start_branch = time.perf_counter()  # 添加开始
+
             if self.branching_strategy == "traditional":
                 # 策略 A: 传统二元分支
                 self.branching(node, heuristic_sequence, f_local=f_local)
@@ -988,6 +1094,11 @@ class EfficientBFS(OptimalAlg):
                 self.branching_naive(node, heuristic_sequence)
             elif self.branching_strategy == 'binary_collapse':
                 self.branching_binary_collapse(node, heuristic_sequence, f_local=f_local)
+            elif self.branching_strategy == 'lazy_binary':
+                self.branching_lazy_binary(node, heuristic_sequence)
+
+            t_end_branch = time.perf_counter()  # 添加结束
+            print(f"[Timer] 策略 {self.branching_strategy} 整体执行耗时: {t_end_branch - t_start_branch:.6f}s")  # 添加输出
             # ================================================
 
         stop_time = time.time()

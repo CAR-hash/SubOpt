@@ -40,7 +40,7 @@ if __name__ == "__main__":
 
     interval = 1
     num_points = 1
-    start_point = 6
+    start_point = 7
     end_point = start_point + (num_points - 1) * interval
     bds = np.linspace(start=start_point, stop=end_point, num=num_points)
 
@@ -58,7 +58,7 @@ if __name__ == "__main__":
             for strategy in args.branching:
                 log_dir = f"./result/archive-{args.archive}/{args.task}/"
                 os.makedirs(log_dir, exist_ok=True)
-                sys.stdout = testlogger.TeeLogger(os.path.join(log_dir, f"{strategy}_{budget}_log.txt"))
+                sys.stdout = testlogger.TeeLogger(os.path.join(log_dir, f"{strategy}_{budget}_{args.heuristic}_log.txt"))
 
                 # 💡 极其重要：随机数种子必须在这里重置！
                 # 确保同一个 seed+budget 下，不管跑哪个策略，底层的随机生成序列完全一致
