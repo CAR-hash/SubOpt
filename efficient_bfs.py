@@ -745,7 +745,7 @@ class EfficientBFS(OptimalAlg):
             open_list_change += 1
 
         return open_list_change
-    
+
     def branching_volume_biased(self, node, heuristic_sequence, top_n=5):
         """
         策略 B：大体积优先。
@@ -850,6 +850,7 @@ class EfficientBFS(OptimalAlg):
                            depth=node.depth + 1)
 
         return open_list_change
+
     def branching_probing_adapt(self, node, heuristic_sequence):
         if self.m_current == 1:
             return self.branching(node, heuristic_sequence)
@@ -1187,4 +1188,3 @@ class EfficientBFS(OptimalAlg):
 
         # 如果遍历完截断的候选集都没有发现任何提升，原样返回
         return best_sol, best_val
-
