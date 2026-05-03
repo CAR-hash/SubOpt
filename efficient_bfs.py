@@ -557,6 +557,14 @@ class EfficientBFS(OptimalAlg):
         return open_list_change
 
     def branching_binary_collapse(self, node, heuristic_sequence, tau=0.85, f_local=float('inf')):
+        # --- 增加防御性检查 ---
+        if not heuristic_sequence:
+            return 0
+
+        # 如果只有一个元素，无法进行双向坍缩测试，直接退化到普通分支
+        if len(heuristic_sequence) < 2:
+            return self.branching(node, heuristic_sequence, f_local)
+
         def density(e, s):
             return self.model.marginal_gain(e, s) / self.model.cost_of_singleton(e)
 
@@ -566,9 +574,6 @@ class EfficientBFS(OptimalAlg):
         # 极端情况防御：如果没有合法元素，或者只有一个元素，直接正常分支或结束
         if e1 is None:
             return
-        # if e2 is None or d2 < tau * d1:
-        #     # 没有老二，或者老二差距太大构不成威胁，退化为普通二叉分支
-        #     self.branching(node, heuristic_sequence, f_local)
         if e2 is None:
             # 没有老二，退化为普通二叉分支
             self.branching(node, heuristic_sequence, f_local)
@@ -1188,3 +1193,94 @@ class EfficientBFS(OptimalAlg):
 
         # 如果遍历完截断的候选集都没有发现任何提升，原样返回
         return best_sol, best_val
+
+
+class AdaptiveEfficientBFS(EfficientBFS):
+    def __init__(self, model: BaseTask):
+        super().__init__(model)
+        # === 动态切换参数 ===
+        # 当剩余预算比例低于此阈值时，切换到极速 ub0 模式
+        self.adaptive_ratio = 0.4
+        self.singleton_gain_cache = {}  # 核心瘦身：单元素缓存
+
+    def greedy_add(self, node):
+        """
+        具备自适应能力的瘦身版 greedy_add
+        """
+
+        def density(ele, base_set):
+            # 极速逻辑：若是空集 S=[] 且有缓存，直接返回
+            if not base_set and ele in self.singleton_gain_cache:
+                return self.singleton_gain_cache[ele]
+
+            gain = self.model.marginal_gain(ele, list(base_set))
+            cost = self.model.cost_of_singleton(ele)
+
+            # 若是空集计算，顺手存入缓存
+            if not base_set:
+                self.singleton_gain_cache[ele] = gain / cost
+            return gain / cost
+
+        base = node.s
+        candidate = node.candidate
+        budget = node.budget
+        sol = set(base)
+        cur_cost = 0
+        heuristic_sequence = []
+
+        # === 策略选择开关 ===
+        # 判定标准：剩余预算是否足够大，大到需要用紧致上界（ub2）来压制搜索树膨胀
+        use_tight_bound = budget > (self.model.budget * self.adaptive_ratio)
+
+        opt = None
+        if use_tight_bound:
+            # 只有在需要紧致评估时才实例化 Slicing 优化器
+            opt = acclerated_upper_bounds.LazySlicingOptimizer(self.model)
+            opt.build(base=base, remaining=set(candidate))
+
+        # 初始局部上界估算
+        if use_tight_bound:
+            f_local = self.g(sol) + opt.solve(set(candidate), budget)
+        else:
+            # 极速模式：直接设为 inf，交给 lazy_binary 阶段处理，或者设为当前解
+            f_local = float('inf')
+
+        # 1. 初始化贪心堆
+        h = []
+        tie_breaker = 0
+        for e in candidate:
+            h.append((-density(e, sol), tie_breaker, e))
+            tie_breaker += 1
+        heapq.heapify(h)
+
+        # 2. 纯粹的 Lazy Greedy 循环
+        while self.timer_proxy.is_active and h:
+            neg_ds, _, u = heapq.heappop(h)
+            cost_u = self.model.cost_of_singleton(u)
+
+            if cur_cost + cost_u > budget:
+                continue
+
+            actual_ds = density(u, sol)
+
+            if not h or actual_ds >= -h[0][0]:
+                sol.add(u)
+                heuristic_sequence.append(u)
+                cur_cost += cost_u
+
+                # ==== 动态上界追踪 ====
+                if use_tight_bound:
+                    opt.update_base(sol)
+                    remaining_for_opt = set(candidate) - sol
+                    # 在贪心过程中动态收紧 f_local
+                    f_temp = self.g(sol) + opt.solve(remaining_for_opt, budget)
+                    f_local = min(f_local, f_temp)
+            else:
+                heapq.heappush(h, (-actual_ds, tie_breaker, u))
+                tie_breaker += 1
+
+        # 若极速模式未算上界，最后用贪心解作为保守下界
+        if not use_tight_bound:
+            f_local = self.g(sol)
+
+        return list(sol), f_local, heuristic_sequence

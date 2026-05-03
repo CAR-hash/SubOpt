@@ -39,7 +39,7 @@ if __name__ == "__main__":
     assert args.heuristic in ['ub0', 'ub1', 'ub2', 'ub0+', 'ub1+', 'ub2+', 'ub4', 'dom']
 
     interval = 1
-    num_points = 1
+    num_points = 10
     start_point = 6
     end_point = start_point + (num_points - 1) * interval
     bds = np.linspace(start=start_point, stop=end_point, num=num_points)
