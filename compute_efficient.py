@@ -35,6 +35,12 @@ if __name__ == "__main__":
     # 注入级联机制
     parser.add_argument("-ca", "--cascade", action="store_true", help="enable the cascade mechanism")
 
+    # ================= 新增：Adaptive 策略相关参数 =================
+    parser.add_argument("-adp", "--adaptive", action="store_true", help="enable AdaptiveEfficientBFS")
+    parser.add_argument("-ar", "--adaptive_ratio", type=float, default=0.4,
+                        help="threshold ratio for adaptive ub0/ub2 switching (default: 0.4)")
+    # ==========================================================
+
     args = parser.parse_args()
     assert args.heuristic in ['ub0', 'ub1', 'ub2', 'ub0+', 'ub1+', 'ub2+', 'ub4', 'dom']
 
@@ -60,14 +66,25 @@ if __name__ == "__main__":
                 os.makedirs(log_dir, exist_ok=True)
                 sys.stdout = testlogger.TeeLogger(os.path.join(log_dir, f"{strategy}_{budget}_{args.heuristic}_log.txt"))
 
+                # 在日志文件名中体现 Adaptive 参数
+                log_prefix = f"Adapt{args.adaptive_ratio}_" if args.adaptive else ""
+                sys.stdout = testlogger.TeeLogger(
+                    os.path.join(log_dir, f"{log_prefix}{strategy}_{budget}_{args.heuristic}_log.txt"))
+
                 # 💡 极其重要：随机数种子必须在这里重置！
                 # 确保同一个 seed+budget 下，不管跑哪个策略，底层的随机生成序列完全一致
                 random.seed(seed)
 
                 # 💡 极其重要：模型和算法必须在策略循环内全新实例化，防止状态污染
                 model = model_factory.model_factory(args.task, args.num, seed, budget, knap=True)
-                alg = efficient_bfs.EfficientBFS(model)
-                # alg = efficient_bfs.EarlyEfficientBFS(model)
+
+                # ================= 核心修改：算法实例化判断 =================
+                if args.adaptive:
+                    alg = efficient_bfs.AdaptiveEfficientBFS(model)
+                    alg.adaptive_ratio = args.adaptive_ratio
+                else:
+                    alg = efficient_bfs.EfficientBFS(model)
+                # ========================================================
 
                 # 参数配置
                 alg.use_alpha = True
