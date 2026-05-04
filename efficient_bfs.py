@@ -1195,21 +1195,27 @@ class EfficientBFS(OptimalAlg):
         return best_sol, best_val
 
 
+import heapq
+import acclerated_upper_bounds
+
+
 class AdaptiveEfficientBFS(EfficientBFS):
-    def __init__(self, model: BaseTask):
+    """
+    自适应极速分支定界求解器。
+    核心思想：根据节点剩余预算的压力，在 ub2 (Slicing，紧致但昂贵) 和 ub0 (Plain，较松但极速) 之间动态切换引擎，
+    在保证算法数学完备性（Upper Bound 绝对合法）的前提下，实现算力收益最大化。
+    """
+
+    def __init__(self, model):
         super().__init__(model)
-        # === 动态切换参数 ===
-        # 当剩余预算比例低于此阈值时，切换到极速 ub0 模式
+        # 动态切换阈值：当节点剩余预算大于总预算的这个比例时，启用 ub2 压制树规模
         self.adaptive_ratio = 0.4
-        self.singleton_gain_cache = {}  # 核心瘦身：单元素缓存
+        # 单元素收益缓存，用于抹除右分支空集的重复计算开销
+        self.singleton_gain_cache = {}
 
     def greedy_add(self, node):
-        """
-        具备自适应能力的瘦身版 greedy_add
-        """
-
         def density(ele, base_set):
-            # 极速逻辑：若是空集 S=[] 且有缓存，直接返回
+            # 极速逻辑：若是空集 S=[] 且有缓存，直接 O(1) 返回
             if not base_set and ele in self.singleton_gain_cache:
                 return self.singleton_gain_cache[ele]
 
@@ -1224,63 +1230,90 @@ class AdaptiveEfficientBFS(EfficientBFS):
         base = node.s
         candidate = node.candidate
         budget = node.budget
+
         sol = set(base)
+        forbidden_sets = getattr(node, 'forbidden_sets', [])
+        remaining_elements = set(candidate)
         cur_cost = 0
         heuristic_sequence = []
 
-        # === 策略选择开关 ===
-        # 判定标准：剩余预算是否足够大，大到需要用紧致上界（ub2）来压制搜索树膨胀
+        # =================================================================
+        # 1. 动态引擎切换 (数学完备性保证)
+        # 绝不放弃计算上界，而是根据预算压力选择对应精度的 Optimizer
+        # =================================================================
         use_tight_bound = budget > (self.model.budget * self.adaptive_ratio)
 
-        opt = None
         if use_tight_bound:
-            # 只有在需要紧致评估时才实例化 Slicing 优化器
+            # 预算充足，组合空间大：上 Slicing 优化器 (ub2)
             opt = acclerated_upper_bounds.LazySlicingOptimizer(self.model)
-            opt.build(base=base, remaining=set(candidate))
-
-        # 初始局部上界估算
-        if use_tight_bound:
-            f_local = self.g(sol) + opt.solve(set(candidate), budget)
         else:
-            # 极速模式：直接设为 inf，交给 lazy_binary 阶段处理，或者设为当前解
-            f_local = float('inf')
+            # 预算较少，规模可控：上 Plain 优化器 (ub0)
+            opt = acclerated_upper_bounds.LazyPlainOptimizer(self.model)
 
-        # 1. 初始化贪心堆
+        # 统一构建底层数据结构
+        opt.build(base=base, remaining=remaining_elements)
+
+        # 获取初始合法上界（无论是 ub0 还是 ub2，在这里算出的都是严谨的理论上限）
+        f_local = self.g(sol) + opt.solve(remaining_elements, budget)
+
+        # =================================================================
+        # 2. 贪心序列初始化
+        # =================================================================
         h = []
         tie_breaker = 0
-        for e in candidate:
-            h.append((-density(e, sol), tie_breaker, e))
+        for e in remaining_elements:
+            heapq.heappush(h, (-density(e, sol), tie_breaker, e))
             tie_breaker += 1
-        heapq.heapify(h)
 
-        # 2. 纯粹的 Lazy Greedy 循环
+        # =================================================================
+        # 3. 核心贪心选择循环
+        # =================================================================
         while self.timer_proxy.is_active and h:
             neg_ds, _, u = heapq.heappop(h)
-            cost_u = self.model.cost_of_singleton(u)
 
+            # --- 约束注入拦截逻辑 ---
+            is_forbidden = False
+            for f_set in forbidden_sets:
+                if u in f_set:
+                    if f_set - {u} <= sol:
+                        is_forbidden = True
+                        break
+            if is_forbidden:
+                continue
+
+            cost_u = self.model.cost_of_singleton(u)
             if cur_cost + cost_u > budget:
                 continue
 
             actual_ds = density(u, sol)
 
+            # 淘汰由于基础集合更新导致密度暴跌的元素
+            while h:
+                top_e = h[0][2]
+                if cur_cost + self.model.cost_of_singleton(top_e) > budget:
+                    heapq.heappop(h)
+                else:
+                    break
+
             if not h or actual_ds >= -h[0][0]:
+                # 确认选中元素 u
                 sol.add(u)
                 heuristic_sequence.append(u)
                 cur_cost += cost_u
 
                 # ==== 动态上界追踪 ====
                 if use_tight_bound:
+                    # 只有在 ub2 模式下，才在贪心循环内步步收紧界限
                     opt.update_base(sol)
-                    remaining_for_opt = set(candidate) - sol
-                    # 在贪心过程中动态收紧 f_local
+                    remaining_for_opt = set(node.candidate) - sol
                     f_temp = self.g(sol) + opt.solve(remaining_for_opt, budget)
-                    f_local = min(f_local, f_temp)
+                    if f_local is None or f_temp < f_local:
+                        f_local = f_temp
+                # ⚠️ ub0 模式下：直接忽略循环内部的上界更新，沿用初始合法的 f_local 换取极速
+
             else:
                 heapq.heappush(h, (-actual_ds, tie_breaker, u))
                 tie_breaker += 1
 
-        # 若极速模式未算上界，最后用贪心解作为保守下界
-        if not use_tight_bound:
-            f_local = self.g(sol)
-
+        # 返回局部下界(sol)，合法上界(f_local)，以及启发式序列(heuristic_sequence)
         return list(sol), f_local, heuristic_sequence
