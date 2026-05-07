@@ -18,8 +18,7 @@ def run_single_experiment(task, num, seed, budget, heuristic, alpha, sorting, br
     alg.use_alpha = True
     alg.alpha = alpha
     alg.set_d(sorting)
-    alg.set_h(heuristic=heuristic)
-    alg.setOpt(heuristic)
+    alg.configure_upper_bound(heuristic)
     alg.branching_strategy = branching
 
     alg.build()

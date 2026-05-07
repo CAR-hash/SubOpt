@@ -1,0 +1,22 @@
+﻿{
+  "num": 1000,
+  "archive": "105",
+  "heuristic": "ub2",
+  "alpha": 0.95,
+  "sorting": "d",
+  "branching": ["traditional"],
+  "start_seed": 1,
+  "stop_seed": 6,
+  "local_search": false,
+  "no_inherit": false,
+  "cascade": false,
+  "opt_solve_log": "result/archive-105/opt_solve_timing.csv",
+  "adaptive": false,
+  "adaptive_ratio": 0.4,
+  "budget_start": 6.0,
+  "budget_num_points": 2,
+  "budget_interval": -1.0,
+  "datasets": [
+    { "task": "youtube", "num": 1000 }
+  ]
+}

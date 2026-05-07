@@ -46,13 +46,11 @@ if __name__ == "__main__":
 
                 # 3. 注入对照组参数
                 alg.branching_strategy = exp["bs"]
-                alg.ub_type = exp["ub"]  # 对应你修改后的 ub_type
                 alg.inherit_bounds = exp["inh"]  # 对应你修改后的继承开关
 
                 # 4. 其他常规配置
                 alg.alpha = args.alpha
-                alg.set_h(heuristic=exp["ub"])  # 同步修改启发式函数
-                alg.setOpt(exp["ub"])
+                alg.configure_upper_bound(exp["ub"])
                 alg.set_d('d')
 
                 # 5. 执行

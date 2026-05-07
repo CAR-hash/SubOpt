@@ -3,142 +3,204 @@ import os
 import pickle
 import random
 import sys
+from datetime import datetime, timezone
 
 import testlogger
 
 import numpy as np
 
+import compute_efficient_config
 import efficient_bfs
 import model_factory
 
+
+def _wrap_result_with_meta(
+    res,
+    *,
+    config_path,
+    cfg,
+    strategy_name_for_file,
+    strategy_raw,
+    heuristic,
+    seed,
+    budget,
+    model,
+):
+    """
+    Backward-compatible result wrapper: preserve original fields and attach structured metadata.
+    """
+    out = dict(res)
+    out["meta"] = {
+        "version": "v1",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "config_path": str(config_path),
+        "task": cfg.task,
+        "archive": str(cfg.archive),
+        "seed": int(seed),
+        "ground_size": int(cfg.num),
+        "algorithm": "AdaptiveEfficientBFS" if cfg.adaptive else "EfficientBFS",
+        "strategy": strategy_name_for_file,
+        "strategy_raw": strategy_raw,
+        "heuristic": heuristic,
+        "d": cfg.sorting,
+        "budget": float(budget),
+        "alpha": float(cfg.alpha),
+        "model_class": model.__class__.__name__,
+        "flags": {
+            "local_search": bool(cfg.local_search),
+            "no_inherit": bool(cfg.no_inherit),
+            "cascade": bool(cfg.cascade),
+            "adaptive": bool(cfg.adaptive),
+        },
+        "adaptive_ratio": float(cfg.adaptive_ratio),
+    }
+    return out
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run EfficientBFS Experiments with Multiple Strategies")
-    parser.add_argument("-t", "--task", default='sensor', help="task name")
-    parser.add_argument("-n", "--num", type=int, default=100, help="size of the ground set")
-    parser.add_argument("-a", "--archive", default="27", help="archive index")
-    parser.add_argument("-hf", "--heuristic", default='ub2', help="the heuristic function")
-    parser.add_argument("-aa", "--alpha", type=float, default=0.8, help="the approximation factor")
-    parser.add_argument("-d", "--sorting", default='d', help="the sorting function for breaking ties")
+    parser = argparse.ArgumentParser(
+        description="Run EfficientBFS experiments from a JSON config file (one or more datasets).",
+    )
+    src = parser.add_mutually_exclusive_group(required=False)
+    src.add_argument(
+        "-c",
+        "--config",
+        metavar="PATH",
+        help="JSON experiment config (see configs/compute_efficient.example.json)",
+    )
+    src.add_argument(
+        "-a",
+        "--archive",
+        metavar="ID",
+        help="run the experiment set for archive ID: load result/archive-{ID}/compute_efficient.json "
+        "if present, else configs/compute_efficient_archive{ID}.json",
+    )
+    parser.add_argument(
+        "--print-example-config",
+        action="store_true",
+        help="print default/example JSON to stdout and exit",
+    )
+    args_cli = parser.parse_args()
 
-    # 修改：支持传入一个列表，如果不传则默认跑完全部 4 种策略
-    parser.add_argument("-bs", "--branching", nargs='+',
-                        default=['traditional', 'density_gap', 'look_ahead'],
-                        help="list of branching strategies to test (space-separated)")
+    if args_cli.print_example_config:
+        sys.stdout.write(compute_efficient_config.default_efficient_config_json())
+        raise SystemExit(0)
 
-    parser.add_argument("--start_seed", type=int, default=0)
-    parser.add_argument("--stop_seed", type=int, default=1)
-    parser.add_argument("-ls", "--local-search",action='store_true',help='enable local search hybrid')
-    # 增加一个开关参数
-    parser.add_argument("-dive", "--use_dive", action="store_true", help="enable Dive-and-Bound (DFS-BFS Hybrid)")
-    # 不使用界限继承的开关（传入该参数则关闭继承）
-    parser.add_argument("-ni", "--no_inherit", action="store_true", help="disable bound inheritance mechanism")
-    # 注入级联机制
-    parser.add_argument("-ca", "--cascade", action="store_true", help="enable the cascade mechanism")
+    if not args_cli.config and not args_cli.archive:
+        parser.error(
+            "specify --config PATH or --archive ID (or use --print-example-config)"
+        )
+    if args_cli.config and args_cli.archive:
+        parser.error("use only one of --config PATH or --archive ID, not both")
 
-    # ================= 新增：Adaptive 策略相关参数 =================
-    parser.add_argument("-adp", "--adaptive", action="store_true", help="enable AdaptiveEfficientBFS")
-    parser.add_argument("-ar", "--adaptive_ratio", type=float, default=0.4,
-                        help="threshold ratio for adaptive ub0/ub2 switching (default: 0.4)")
-    # ==========================================================
+    if args_cli.archive:
+        config_path = compute_efficient_config.resolve_config_path_for_archive(args_cli.archive)
+        print(f"Archive {args_cli.archive!r}: using config {config_path}")
+    else:
+        config_path = args_cli.config
 
-    args = parser.parse_args()
-    assert args.heuristic in ['ub0', 'ub1', 'ub2', 'ub0+', 'ub1+', 'ub2+', 'ub4', 'dom']
+    run_configs = compute_efficient_config.load_efficient_run_configs(config_path)
+    n_datasets = len(run_configs)
+    print(f"Loaded {n_datasets} dataset(s) from {config_path}")
 
-    interval = 1
-    num_points = 10
-    start_point = 6
-    end_point = start_point + (num_points - 1) * interval
-    bds = np.linspace(start=start_point, stop=end_point, num=num_points)
+    for di, cfg in enumerate(run_configs):
+        print(f"\n{'=' * 60}\nDataset {di + 1}/{n_datasets}: task={cfg.task!r}, num={cfg.num}\n{'=' * 60}")
 
-    root_dir = os.path.join("./result", f"archive-{args.archive}")
+        end_point = cfg.budget_start + (cfg.budget_num_points - 1) * cfg.budget_interval
+        bds = np.linspace(start=cfg.budget_start, stop=end_point, num=cfg.budget_num_points)
 
-    # 打印本次实验要跑的所有策略
-    print(f"🚀 Starting Experiments | Task: {args.task} | Strategies to test: {args.branching}")
+        root_dir = os.path.join("./result", f"archive-{cfg.archive}")
 
-    for seed in range(args.start_seed, args.stop_seed):
-        for budget in bds:
+        print(f"[START] Experiments | Task: {cfg.task} | Strategies: {cfg.branching}")
 
-            print(f"\n--- Testing Seed: {seed:02d} | Budget: {budget:4.1f} ---")
+        for seed in range(cfg.start_seed, cfg.stop_seed):
+            for budget in bds:
 
-            # 最内层循环：遍历所有指定的分支策略
-            for strategy in args.branching:
-                log_dir = f"./result/archive-{args.archive}/{args.task}/"
-                os.makedirs(log_dir, exist_ok=True)
-                sys.stdout = testlogger.TeeLogger(os.path.join(log_dir, f"{strategy}_{budget}_{args.heuristic}_log.txt"))
+                print(f"\n--- Task {cfg.task!r} | Seed: {seed:02d} | Budget: {budget:4.1f} ---")
 
-                # 在日志文件名中体现 Adaptive 参数
-                log_prefix = f"Adapt{args.adaptive_ratio}_" if args.adaptive else ""
-                sys.stdout = testlogger.TeeLogger(
-                    os.path.join(log_dir, f"{log_prefix}{strategy}_{budget}_{args.heuristic}_log.txt"))
+                for strategy in cfg.branching:
+                    for heuristic in cfg.heuristics:
+                        log_dir = f"./result/archive-{cfg.archive}/{cfg.task}/"
+                        os.makedirs(log_dir, exist_ok=True)
+                        log_prefix = f"Adapt{cfg.adaptive_ratio}_" if cfg.adaptive else ""
+                        log_path = os.path.join(
+                            log_dir, f"{log_prefix}{strategy}_{budget}_{heuristic}_log.txt")
 
-                # 💡 极其重要：随机数种子必须在这里重置！
-                # 确保同一个 seed+budget 下，不管跑哪个策略，底层的随机生成序列完全一致
-                random.seed(seed)
+                        with testlogger.TeeLogger(log_path):
+                            random.seed(seed)
 
-                # 💡 极其重要：模型和算法必须在策略循环内全新实例化，防止状态污染
-                model = model_factory.model_factory(args.task, args.num, seed, budget, knap=True)
+                            model = model_factory.model_factory(cfg.task, cfg.num, seed, budget, knap=True)
 
-                # ================= 核心修改：算法实例化判断 =================
-                if args.adaptive:
-                    alg = efficient_bfs.AdaptiveEfficientBFS(model)
-                    alg.adaptive_ratio = args.adaptive_ratio
-                else:
-                    alg = efficient_bfs.EfficientBFS(model)
-                # ========================================================
+                            if cfg.adaptive:
+                                alg = efficient_bfs.AdaptiveEfficientBFS(model)
+                                alg.adaptive_ratio = cfg.adaptive_ratio
+                            else:
+                                alg = efficient_bfs.EfficientBFS(model)
 
-                # 参数配置
-                alg.use_alpha = True
-                alg.local_search = args.local_search
-                alg.alpha = args.alpha
-                alg.set_d(args.sorting)
-                alg.set_h(heuristic=args.heuristic)
-                alg.setOpt(args.heuristic)
-                alg.inherit_bounds = not args.no_inherit
-                # ... 在实例化 alg 之后 ...
-                alg.use_dive = args.use_dive
-                alg.ub_type = args.heuristic
+                            alg.use_alpha = True
+                            alg.local_search = cfg.local_search
+                            alg.alpha = cfg.alpha
+                            alg.set_d(cfg.sorting)
+                            alg.configure_upper_bound(heuristic)
+                            alg.configure_aux_upper_bound(cfg.aux_heuristic)
+                            alg.inherit_bounds = not cfg.no_inherit
+                            if cfg.cascade:
+                                alg.use_cascade = True
 
-                # 同样地，把开启了下潜的策略在文件名上标记出来，防止文件覆盖
-                strategy_name_for_file = strategy
-                if args.local_search:
-                    strategy_name_for_file += "_LS"
-                if args.use_dive:
-                    strategy_name_for_file += "_Dive"
-                if args.no_inherit:
-                    strategy_name_for_file += "_NoInh"  # 标识未开启继承
+                            strategy_name_for_file = strategy
+                            if cfg.local_search:
+                                strategy_name_for_file += "_LS"
+                            if cfg.no_inherit:
+                                strategy_name_for_file += "_NoInh"
 
-                # 注入当前循环到的分支策略
-                alg.branching_strategy = strategy
+                            alg.branching_strategy = strategy
 
-                # 初始化与执行
-                alg.build()
-                res = alg.optimize()
+                            if cfg.opt_solve_log:
+                                alg.opt_solve_log_path = cfg.opt_solve_log
+                                alg.opt_solve_log_meta = {
+                                    "task": cfg.task,
+                                    "seed": int(seed),
+                                    "budget": float(budget),
+                                    "branching": strategy,
+                                    "heuristic_cli": heuristic,
+                                }
 
-                # 打印单次策略的结果
-                node_cnt = res.get('node_count', -1)
-                time_cost = res.get('time', 0.0)
-                function_val = res.get('f(S)', 0.0)
-                print(f"trigger count:{res.get('probing_trigger_count', 0)}, depth_list:{res.get('probing_trigger_depth_list', [])}, max_depth:{res.get('max_depth', 0)}")
-                if not res.get('TLE', False):
-                    print(f"  ✅ Strategy: {strategy_name_for_file:<14s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | Time: {time_cost:.2f}s")
-                else:
-                    print(f"  ❌ Strategy: {strategy_name_for_file:<14s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | TLE: {time_cost:.2f}s")
+                            alg.build()
+                            res = alg.optimize()
 
-                # 文件保存
-                save_dir = os.path.join(root_dir, args.task, str(args.num), str(seed))
-                os.makedirs(save_dir, exist_ok=True)
+                            node_cnt = res.get('node_count', -1)
+                            time_cost = res.get('time', 0.0)
+                            function_val = res.get('f(S)', 0.0)
+                            print(f"trigger count:{res.get('probing_trigger_count', 0)}, depth_list:{res.get('probing_trigger_depth_list', [])}, max_depth:{res.get('max_depth', 0)}")
+                            if not res.get('TLE', False):
+                                print(f"  [OK] Strategy: {strategy_name_for_file:<14s} | h:{heuristic:<4s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | Time: {time_cost:.2f}s")
+                            else:
+                                print(f"  [TLE] Strategy: {strategy_name_for_file:<14s} | h:{heuristic:<4s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | TLE: {time_cost:.2f}s")
 
-                filename = "EfficientBFS-{}-{}-{}-{}-{}-{}.pckl".format(
-                    strategy_name_for_file,
-                    args.heuristic,
-                    args.sorting,
-                    budget,
-                    args.alpha,
-                    model.__class__.__name__
-                )
-                save_path = os.path.join(save_dir, filename)
+                            save_dir = os.path.join(root_dir, cfg.task, str(cfg.num), str(seed))
+                            os.makedirs(save_dir, exist_ok=True)
 
-                with open(save_path, "wb") as wrt:
-                    pickle.dump(res, wrt)
+                            filename = "EfficientBFS-{}-{}-{}-{}-{}-{}.pckl".format(
+                                strategy_name_for_file,
+                                heuristic,
+                                cfg.sorting,
+                                budget,
+                                cfg.alpha,
+                                model.__class__.__name__
+                            )
+                            save_path = os.path.join(save_dir, filename)
 
-    print("\n🎉 All experiments completed!")
+                            wrapped = _wrap_result_with_meta(
+                                res,
+                                config_path=config_path,
+                                cfg=cfg,
+                                strategy_name_for_file=strategy_name_for_file,
+                                strategy_raw=strategy,
+                                heuristic=heuristic,
+                                seed=seed,
+                                budget=budget,
+                                model=model,
+                            )
+                            with open(save_path, "wb") as wrt:
+                                pickle.dump(wrapped, wrt)
+
+    print("\n[DONE] All experiments completed!")

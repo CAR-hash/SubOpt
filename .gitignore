@@ -195,3 +195,4 @@ dataset/adult-income/adult.csv
 dataset/custom-graph/
 output/
 *.png
+notebooks/postgres_config.json

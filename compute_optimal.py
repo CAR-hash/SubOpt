@@ -49,116 +49,117 @@ if __name__ == "__main__":
         for budget in bds:
             log_dir = f"./result/archive-{args.archive}/{args.task}/"
             os.makedirs(log_dir, exist_ok=True)
-            sys.stdout = testlogger.TeeLogger(os.path.join(log_dir, f"{args.algorithm}_{budget}_log.txt"))
+            log_path = os.path.join(log_dir, f"{args.algorithm}_{budget}_log.txt")
 
-            for ub in ub_list:
-                for d in d_list:
-                    random.seed(seed)
-                    model = model_factory.model_factory(args.task, int(args.num), seed, budget, knap=True)
+            with testlogger.TeeLogger(log_path):
+                for ub in ub_list:
+                    for d in d_list:
+                        random.seed(seed)
+                        model = model_factory.model_factory(args.task, int(args.num), seed, budget, knap=True)
 
-                    alg = None
-                    if args.algorithm == 'FS':
+                        alg = None
+                        if args.algorithm == 'FS':
 
-                        alg = filter_search.FS(model)
-                    elif args.algorithm == 'AFS':
-                        alg = filter_search.AugmentedFS(model)
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'BAFSa':
-                        alg = filter_search.BestAugmentedFS(model)
-                        alg.use_alpha = True
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'BAFSna':
-                        alg = filter_search.BestAugmentedFS(model)
-                        alg.use_alpha = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'BAFSmore':
-                        alg = filter_search.BestAugmentedMoreFS(model)
-                        alg.use_alpha = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'BAFSmorealpha':
-                        alg = filter_search.BestAugmentedMoreFS(model)
-                        alg.use_alpha = True
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'BAFSmorenpb':
-                        alg = filter_search.BestAugmentedMoreFS(model)
-                        alg.use_alpha = False
-                        alg.pushing_back = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'IDA':
-                        alg = id_aster.IDAstar(model)
-                    elif args.algorithm == 'Astar':
-                        alg = a_star.Astar(model)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'Efficient':
-                        alg = filter_search.EfficientBranchAndBound(model)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'BasicEfficient':
-                        alg = filter_search.EfficientBranchAndBound(model)
-                        alg.basic_mode = True
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'EfficientBFS':
-                        alg = efficient_bfs.EfficientBFS(model)
-                        alg.use_alpha = False
-                        alg.pushing_back = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'EfficientBFSNheap':
-                        alg = filter_search.EfficientBFS(model)
-                        alg.heap_class = 'simple'
-                        alg.use_alpha = False
-                        alg.pushing_back = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'EfficientBFSNheapNi':
-                        # no inherit
-                        alg = filter_search.EfficientBFSNoInherit(model)
-                        alg.heap_class = 'simple'
-                        alg.use_alpha = False
-                        alg.pushing_back = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'EfficientBFSNheapN2':
-                        # no ub2
-                        alg = filter_search.EfficientBFS(model)
-                        alg.heap_class = 'simple'
-                        alg.use_alpha = False
-                        alg.pushing_back = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic='ub0')
-                    elif args.algorithm == 'BFSNheap':
-                        # no efficient
-                        alg = filter_search.InheritBFS(model)
-                        alg.heap_class = 'simple'
-                        alg.use_alpha = False
-                        alg.pushing_back = False
-                        alg.set_d(d)
-                        alg.set_h(heuristic=ub)
-                    elif args.algorithm == 'BFSTC':
-                        alg = filter_search.BFSTC(model)
-                        alg.heap_class = 'simple'
-                        alg.set_h(heuristic='ub0')
-                    elif args.algorithm == 'ILP':
-                        alg = filter_search.ILP(model)
-                        alg.set_h(heuristic=ub)
+                            alg = filter_search.FS(model)
+                        elif args.algorithm == 'AFS':
+                            alg = filter_search.AugmentedFS(model)
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'BAFSa':
+                            alg = filter_search.BestAugmentedFS(model)
+                            alg.use_alpha = True
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'BAFSna':
+                            alg = filter_search.BestAugmentedFS(model)
+                            alg.use_alpha = False
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'BAFSmore':
+                            alg = filter_search.BestAugmentedMoreFS(model)
+                            alg.use_alpha = False
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'BAFSmorealpha':
+                            alg = filter_search.BestAugmentedMoreFS(model)
+                            alg.use_alpha = True
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'BAFSmorenpb':
+                            alg = filter_search.BestAugmentedMoreFS(model)
+                            alg.use_alpha = False
+                            alg.pushing_back = False
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'IDA':
+                            alg = id_aster.IDAstar(model)
+                        elif args.algorithm == 'Astar':
+                            alg = a_star.Astar(model)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'Efficient':
+                            alg = filter_search.EfficientBranchAndBound(model)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'BasicEfficient':
+                            alg = filter_search.EfficientBranchAndBound(model)
+                            alg.basic_mode = True
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'EfficientBFS':
+                            alg = efficient_bfs.EfficientBFS(model)
+                            alg.use_alpha = False
+                            alg.pushing_back = False
+                            alg.set_d(d)
+                            alg.configure_upper_bound(ub)
+                        elif args.algorithm == 'EfficientBFSNheap':
+                            alg = filter_search.EfficientBFS(model)
+                            alg.heap_class = 'simple'
+                            alg.use_alpha = False
+                            alg.pushing_back = False
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'EfficientBFSNheapNi':
+                            # no inherit
+                            alg = filter_search.EfficientBFSNoInherit(model)
+                            alg.heap_class = 'simple'
+                            alg.use_alpha = False
+                            alg.pushing_back = False
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'EfficientBFSNheapN2':
+                            # no ub2
+                            alg = filter_search.EfficientBFS(model)
+                            alg.heap_class = 'simple'
+                            alg.use_alpha = False
+                            alg.pushing_back = False
+                            alg.set_d(d)
+                            alg.set_h(heuristic='ub0')
+                        elif args.algorithm == 'BFSNheap':
+                            # no efficient
+                            alg = filter_search.InheritBFS(model)
+                            alg.heap_class = 'simple'
+                            alg.use_alpha = False
+                            alg.pushing_back = False
+                            alg.set_d(d)
+                            alg.set_h(heuristic=ub)
+                        elif args.algorithm == 'BFSTC':
+                            alg = filter_search.BFSTC(model)
+                            alg.heap_class = 'simple'
+                            alg.set_h(heuristic='ub0')
+                        elif args.algorithm == 'ILP':
+                            alg = filter_search.ILP(model)
+                            alg.set_h(heuristic=ub)
 
-                    alg.alpha = alpha
-                    alg.setOpt(ub)
-                    alg.build()
-                    res = alg.optimize()
-                    print(f"Done:seed:{seed}/{stop_seed - start_seed + 1}, ub:{ub}, d:{d}, budget:{budget}, res:{res}")
+                        alg.alpha = alpha
+                        alg.setOpt(ub)
+                        alg.build()
+                        res = alg.optimize()
+                        print(f"Done:seed:{seed}/{stop_seed - start_seed + 1}, ub:{ub}, d:{d}, budget:{budget}, res:{res}")
 
-                    save_dir = os.path.join(root_dir, args.task, f'{args.num}', f'{seed}')
-                    if not os.path.exists(save_dir):
-                        os.mkdir(save_dir)
+                        save_dir = os.path.join(root_dir, args.task, f'{args.num}', f'{seed}')
+                        if not os.path.exists(save_dir):
+                            os.mkdir(save_dir)
 
-                    save_path = os.path.join(save_dir, "{}-{}-{}-{}-{}-{}.pckl".format(
-                        args.algorithm, ub, d, budget, alpha, model.__class__.__name__))
+                        save_path = os.path.join(save_dir, "{}-{}-{}-{}-{}-{}.pckl".format(
+                            args.algorithm, ub, d, budget, alpha, model.__class__.__name__))
 
-                    with open(save_path, "wb") as wrt:
-                        pickle.dump(res, wrt)
+                        with open(save_path, "wb") as wrt:
+                            pickle.dump(res, wrt)

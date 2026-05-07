@@ -1,0 +1,24 @@
+{
+  "num": 100,
+  "archive": "27",
+  "heuristic": "ub2",
+  "heuristics": ["ub0", "ub2"],
+  "alpha": 0.8,
+  "sorting": "d",
+  "branching": ["traditional", "density_gap", "look_ahead"],
+  "start_seed": 0,
+  "stop_seed": 1,
+  "local_search": false,
+  "no_inherit": false,
+  "cascade": false,
+  "opt_solve_log": null,
+  "adaptive": false,
+  "adaptive_ratio": 0.4,
+  "budget_start": 10.0,
+  "budget_num_points": 1,
+  "budget_interval": 1.0,
+  "datasets": [
+    { "task": "youtube" },
+    { "task": "adult", "num": 200 }
+  ]
+}
