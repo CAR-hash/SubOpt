@@ -20,10 +20,24 @@ from typing import Any, FrozenSet, Mapping, Optional
 
 HEURISTIC_CHOICES: FrozenSet[str] = frozenset({"ub0", "ub0+", "ub2", "ub2+"})
 
+ALGORITHM_CHOICES: FrozenSet[str] = frozenset({
+    "EfficientBFS",
+    "AdaptiveEfficientBFS",
+    "BFSTC",
+    "EfficientBranchAndBound",
+})
+
+# Algorithms that support branching strategies; others ignore ``branching``.
+_ALGORITHMS_WITH_BRANCHING: FrozenSet[str] = frozenset({
+    "EfficientBFS",
+    "AdaptiveEfficientBFS",
+})
+
 _DEFAULT_FLAT: dict[str, Any] = {
     "task": "sensor",
     "num": 100,
     "archive": "27",
+    "algorithm": "EfficientBFS",
     "heuristic": "ub2",
     "heuristics": ["ub2"],
     "aux_heuristic": "ub0",
@@ -36,11 +50,17 @@ _DEFAULT_FLAT: dict[str, Any] = {
     "no_inherit": False,
     "cascade": False,
     "opt_solve_log": None,
+    # ``adaptive`` is deprecated: prefer ``algorithm`` = ``"AdaptiveEfficientBFS"``.
+    # Kept for backward compatibility; auto-promotes to the new field when the JSON file
+    # only contains ``adaptive`` (and no explicit ``algorithm``).
     "adaptive": False,
     "adaptive_ratio": 0.4,
     "budget_start": 10.0,
     "budget_num_points": 1,
     "budget_interval": 1.0,
+    # Per-run wall-clock cap (seconds). Applied to ``EfficientBFS`` (TimerProxy) and to
+    # ``BFSTC`` / ``EfficientBranchAndBound`` (their internal ``time_limit`` field).
+    "time_limit_seconds": 5000.0,
 }
 
 ALLOWED_KEYS: FrozenSet[str] = frozenset(_DEFAULT_FLAT.keys())
@@ -74,6 +94,7 @@ class EfficientRunConfig:
     task: str
     num: int
     archive: str
+    algorithm: str
     heuristic: str
     heuristics: list
     aux_heuristic: str
@@ -91,6 +112,12 @@ class EfficientRunConfig:
     budget_start: float
     budget_num_points: int
     budget_interval: float
+    time_limit_seconds: float
+
+    @property
+    def supports_branching(self) -> bool:
+        """Whether ``cfg.branching`` is meaningful for the configured algorithm."""
+        return self.algorithm in _ALGORITHMS_WITH_BRANCHING
 
 
 def default_efficient_config_json() -> str:
@@ -118,10 +145,53 @@ def _merge_raw(raw: Mapping[str, Any]) -> dict[str, Any]:
         )
     merged = dict(_DEFAULT_FLAT)
     merged.update(raw)
+    # Track which keys were supplied by the user (vs. injected defaults). Needed for
+    # legacy-vs-explicit disambiguation when promoting the deprecated ``adaptive`` flag.
+    merged["_user_keys"] = frozenset(raw)
     return merged
 
 
+def _resolve_algorithm(m: Mapping[str, Any]) -> str:
+    """
+    Resolve the algorithm name with backward-compat handling for the deprecated
+    ``adaptive`` flag.
+
+    Rules:
+    * If ``algorithm`` is set explicitly by the user, use it (and validate).
+    * Otherwise, if the user set the legacy ``adaptive=true`` flag, auto-map to
+      ``AdaptiveEfficientBFS`` and emit a ``DeprecationWarning``.
+    * Otherwise fall back to the merged value (default ``EfficientBFS``).
+    """
+    user_keys = m.get("_user_keys", frozenset())
+    legacy_adaptive = bool(m.get("adaptive", False))
+    user_set_algorithm = "algorithm" in user_keys
+    user_set_adaptive = "adaptive" in user_keys and legacy_adaptive
+
+    if user_set_algorithm:
+        algorithm = str(m["algorithm"]).strip()
+    elif user_set_adaptive:
+        import warnings as _warnings
+        _warnings.warn(
+            "Config field 'adaptive' is deprecated; use "
+            "'algorithm': 'AdaptiveEfficientBFS' instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        algorithm = "AdaptiveEfficientBFS"
+    else:
+        algorithm = str(m.get("algorithm", _DEFAULT_FLAT["algorithm"]))
+
+    if algorithm not in ALGORITHM_CHOICES:
+        raise ValueError(
+            "algorithm must be one of %s, got %r"
+            % (", ".join(sorted(ALGORITHM_CHOICES)), algorithm)
+        )
+    return algorithm
+
+
 def _merged_dict_to_config(m: Mapping[str, Any]) -> EfficientRunConfig:
+    algorithm = _resolve_algorithm(m)
+
     heuristic = m["heuristic"]
     if heuristic not in HEURISTIC_CHOICES:
         raise ValueError(
@@ -169,10 +239,12 @@ def _merged_dict_to_config(m: Mapping[str, Any]) -> EfficientRunConfig:
     if m["budget_num_points"] < 1:
         raise ValueError("budget_num_points must be >= 1")
 
-    for key in ("alpha", "adaptive_ratio", "budget_start", "budget_interval"):
+    for key in ("alpha", "adaptive_ratio", "budget_start", "budget_interval", "time_limit_seconds"):
         v = m[key]
         if not isinstance(v, (int, float)):
             raise TypeError(f"{key!r} must be a number, got {type(v).__name__}")
+    if float(m["time_limit_seconds"]) <= 0.0:
+        raise ValueError("time_limit_seconds must be positive")
 
     osl = m["opt_solve_log"]
     if osl is not None and (not isinstance(osl, str) or not osl.strip()):
@@ -186,10 +258,15 @@ def _merged_dict_to_config(m: Mapping[str, Any]) -> EfficientRunConfig:
     if not isinstance(task, str) or not task.strip():
         raise ValueError("task must be a non-empty string (set in shared defaults or in each datasets[] entry)")
 
+    # Keep ``adaptive`` in sync with ``algorithm`` so downstream code that still reads
+    # the legacy field does not silently disagree with the resolved algorithm.
+    adaptive_flag = (algorithm == "AdaptiveEfficientBFS")
+
     return EfficientRunConfig(
         task=str(task).strip(),
         num=num,
         archive=str(m["archive"]),
+        algorithm=algorithm,
         heuristic=str(heuristic),
         heuristics=list(heuristics),
         aux_heuristic=str(aux_heuristic),
@@ -202,11 +279,12 @@ def _merged_dict_to_config(m: Mapping[str, Any]) -> EfficientRunConfig:
         no_inherit=_coerce_bool(m["no_inherit"], "no_inherit"),
         cascade=_coerce_bool(m["cascade"], "cascade"),
         opt_solve_log=osl.strip() if isinstance(osl, str) else None,
-        adaptive=_coerce_bool(m["adaptive"], "adaptive"),
+        adaptive=adaptive_flag,
         adaptive_ratio=ar,
         budget_start=float(m["budget_start"]),
         budget_num_points=m["budget_num_points"],
         budget_interval=float(m["budget_interval"]),
+        time_limit_seconds=float(m["time_limit_seconds"]),
     )
 
 
@@ -281,6 +359,9 @@ def load_efficient_run_configs(path: str | Path) -> list[EfficientRunConfig]:
             )
         m = dict(base)
         m.update(ds)
+        # User-provided keys = root-level shared keys ∪ per-entry overrides; needed for
+        # legacy-vs-explicit ``algorithm``/``adaptive`` disambiguation.
+        m["_user_keys"] = frozenset(set(shared) | set(ds))
         task = m.get("task")
         if not isinstance(task, str) or not task.strip():
             raise ValueError(

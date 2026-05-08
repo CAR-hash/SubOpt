@@ -154,6 +154,10 @@ class EfficientBFS(OptimalAlg):
 
         self.timer_proxy = None
 
+        # Per-run wall-clock cap (seconds). Used by ``optimize`` to build ``TimerProxy``.
+        # Override via :class:`compute_efficient_config.EfficientRunConfig.time_limit_seconds`.
+        self.time_limit_seconds = 5000.0
+
         # === 继承机制控制器 ===
         self.inherit_bounds = True  # 默认开启继承
 
@@ -1097,7 +1101,7 @@ class EfficientBFS(OptimalAlg):
         → ``_bfs_process_node`` (greedy / prune / ``_bfs_apply_branching``) on :class:`BfsSearchContext`.
         """
         start_time = time.time()
-        self.timer_proxy = TimerProxy(timeout_seconds=5000)
+        self.timer_proxy = TimerProxy(timeout_seconds=self.time_limit_seconds)
 
         t_start_root = time.perf_counter()
         root, f_upper, heuristic_sequence, self.s_max = self.push_root()

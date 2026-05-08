@@ -1074,14 +1074,11 @@ class EfficientBranchAndBound(OptimalAlg):
         super().__init__(model)
         self.lb_star = None
         self.s_star = None
-        self.lbd = None
         self.node_count = 0
         self.basic_mode = False
         self.get_children = None
 
         self.children_count = 0
-        self.time_for_stage_0 = 0
-        self.time_for_stage_1 = 0
 
         self.start_time = 0
         self.TLE = False
@@ -1089,13 +1086,17 @@ class EfficientBranchAndBound(OptimalAlg):
 
         self.ub_global = 0
 
+        # When True, dump per-node / per-child trace via ``print``. Default off because
+        # those statements dominate runtime on non-trivial problems (each line is also
+        # tee'd to disk by ``compute_efficient.TeeLogger``).
+        self.verbose = False
+
     def set_h(self, heuristic):
-        if heuristic == 'ub0':
-            self.lbd = self.lbd0
-        elif heuristic == 'ub2':
-            self.lbd = self.lbd2
-        elif heuristic == 'dom':
-            self.lbd = self.lbd_dom
+        # EBB does not use the node heuristic ``self.lbd`` / ``self.inner_h`` anywhere.
+        # Keeping the method as a no-op so the algorithm factory can call it uniformly
+        # without us silently picking up the base class' ``self.inner_h`` / ``self.lbd``
+        # for an algorithm that never reads them.
+        return
 
     def build(self):
         self.lb_star = 0
@@ -1107,42 +1108,47 @@ class EfficientBranchAndBound(OptimalAlg):
             self.get_children = self.get_children_advance
 
     def greedy_add(self, t):
+        """
+        Lazy-greedy fill of ``t``. Returns ``(sol, f_local, c, g_prefix)`` where
+        ``g_prefix[i] = self.g(t.s ∪ c[:i])`` so :meth:`get_children_advance` can
+        avoid recomputing the prefix objective with another ``model.objective`` call
+        for every child (#7).
+        """
         def density(ele, base_set):
             return self.model.marginal_gain(ele, list(base_set)) / self.model.cost_of_singleton(ele)
 
         base = t.s
         sol = set(base)
-        base_cost = self.model.cost_of_set(list(sol))
         remaining_elements = set(t.candidate)
         cur_cost = self.model.cost_of_set(list(sol))
 
         opt = acclerated_upper_bounds.LazyPlainOptimizer(self.model)
         opt.build(base=base, remaining=remaining_elements)
 
-        f_local = self.g(sol) + opt.solve(remaining_elements, t.budget)
+        g_base = self.g(sol)
+        # ``g_prefix[i]`` is the objective at ``t.s ∪ c[:i]``. Initially we only know
+        # ``g_prefix[0] = g(t.s)`` and append as elements are committed in greedy order.
+        g_prefix = [g_base]
+
+        f_local = g_base + opt.solve(remaining_elements, t.budget)
         c = []
 
-        # 1. Initialize the max heap for outer greedy loop
         h = []
         for e in remaining_elements:
-            # print(f"elapsed:{time.time() - self.start_time}")
             if time.time() - self.start_time > self.time_limit:
                 self.TLE = True
-                return sol, f_local, c
+                return list(sol), f_local, c, g_prefix
             heapq.heappush(h, (-density(e, base), e))
 
         while h:
-            # print(f"elapsed2:{time.time() - self.start_time}")
             if time.time() - self.start_time > self.time_limit:
                 self.TLE = True
-                return sol, f_local, c
+                return list(sol), f_local, c, g_prefix
             _, u = heapq.heappop(h)
             if cur_cost + self.model.cost_of_singleton(u) > t.budget:
-                # u does not satisfy the knapsack constraint
                 remaining_elements.remove(u)
                 continue
 
-            # 2. Evaluate the actual density
             actual_density = density(u, list(sol))
 
             if not h or actual_density >= -h[0][0]:
@@ -1150,17 +1156,27 @@ class EfficientBranchAndBound(OptimalAlg):
                 c.append(u)
                 remaining_elements.remove(u)
                 opt.update_base(sol)
-                f_temp = self.g(sol) + opt.solve(remaining_set=set(t.candidate) - set(sol),
-                                                 budget=t.budget)
+                g_sol = self.g(sol)
+                g_prefix.append(g_sol)
+                f_temp = g_sol + opt.solve(remaining_set=set(t.candidate) - set(sol),
+                                           budget=t.budget)
                 if f_local is None or f_temp < f_local:
                     f_local = f_temp
                 cur_cost += self.model.cost_of_singleton(u)
             else:
                 heapq.heappush(h, (-actual_density, u))
 
-        return list(sol), f_local, c
+        return list(sol), f_local, c, g_prefix
 
-    def get_children_advance(self, t: BranchAndBoundNode, c):
+    def get_children_advance(self, t: BranchAndBoundNode, c, g_prefix=None):
+        """
+        Build child branches by complementary exclusion of each ``c[i]``.
+
+        ``g_prefix`` (optional, computed by :meth:`greedy_add`) caches
+        ``self.model.objective(s ∪ c[:i])`` for ``i = 0..len(c)``; passing it avoids
+        ``len(c) + 1`` extra ``model.objective`` calls per node (#7). When omitted
+        (legacy callers), we fall back to recomputing — same behavior as before.
+        """
         children = []
         s = t.s
 
@@ -1178,20 +1194,18 @@ class EfficientBranchAndBound(OptimalAlg):
             opt.update_base(base_set)
             upper_bound_delta = opt.solve(remaining_set, budget_i)
 
-            current_f = self.model.objective(list(base_set))
+            if g_prefix is not None and i < len(g_prefix):
+                current_f = g_prefix[i]
+            else:
+                current_f = self.model.objective(list(base_set))
 
             node_ub = current_f + upper_bound_delta
-            # print(f"examing child {temp}, budget_i:{budget_i} candidate:{set(self.model.ground_set) - set(remaining_set)} lbd:{current_f + upper_bound_delta}")
             if self.alpha * node_ub > self.lb_star:
-                # print("succeed")
-                # ====== 全透视追踪 5：生成子节点 ======
-                print(f"      ├── 🌿 [BRANCH] 生成子节点 S: {list(base_set)} | 排除: {c[i]} | UB: {node_ub:.4f}")
-                # ====================================
+                if self.verbose:
+                    print(f"      ├── 🌿 [BRANCH] 生成子节点 S: {list(base_set)} | 排除: {c[i]} | UB: {node_ub:.4f}")
                 children.append(temp)
-            else:
-                # ====== 全透视追踪 6：子节点流产 ======
+            elif self.verbose:
                 print(f"      ├── ✂️ [PRUNED] 丢弃子节点 S: {list(base_set)} | 排除: {c[i]} | UB: {node_ub:.4f} <= LB")
-                # ====================================
 
         # 3. Process the final child (including all elements of c)
         base_set_final = set(s) | set(c)
@@ -1202,16 +1216,20 @@ class EfficientBranchAndBound(OptimalAlg):
 
         opt.update_base(base_set_final)
         upper_bound_delta_final = opt.solve(remaining_set_final, budget_final)
-        current_f_final = self.model.objective(list(base_set_final))
+        if g_prefix is not None and len(c) < len(g_prefix):
+            current_f_final = g_prefix[len(c)]
+        else:
+            current_f_final = self.model.objective(list(base_set_final))
 
-        # print(f"examing child {temp}, lbd:{current_f_final + upper_bound_delta_final}")
         if current_f_final + upper_bound_delta_final > self.lb_star:
-            # print("succeed")
             children.append(temp)
 
         return children
 
-    def get_children_basic(self, t: BranchAndBoundNode, c):
+    def get_children_basic(self, t: BranchAndBoundNode, c, g_prefix=None):
+        # ``g_prefix`` accepted for signature parity with :meth:`get_children_advance`;
+        # this variant doesn't use cached objectives.
+        del g_prefix
         children = []
         s = t.s
         tc = list(t.cost)
@@ -1226,123 +1244,71 @@ class EfficientBranchAndBound(OptimalAlg):
         return children
 
 
-    def bab(self, t: BranchAndBoundNode):
-        t0 = time.time()
-        self.node_count = self.node_count + 1
-
-        if len(t.candidate) == 0:
-            return
-
-        if self.is_on_the_edge(t):
-            return
-
-        s_primal, f_local, c = self.greedy_add(t)
-
-        if self.g(s_primal) > self.lb_star:
-            self.lb_star = self.g(s_primal)
-            self.s_star = s_primal
-
-        ub = f_local
-        if self.alpha * ub <= self.lb_star:
-            return
-
-        t1 = time.time()
-
-        children = self.get_children(t, c)
-
-        t2 = time.time()
-
-        for t_i in children:
-            self.bab(t_i)
-
-        self.time_for_stage_0 += t1 - t0
-        self.time_for_stage_1 += t2 - t1
-        self.children_count += len(children)
-
     def bab_stack(self, initial_node: BranchAndBoundNode):
-        # Use a list as a stack (LIFO)
+        # Iterative DFS over the branch-and-bound tree. Replaces the (deleted) recursive
+        # ``bab`` method which was unused.
         stack = [initial_node]
         while stack:
-            # Get the current node
             t = stack.pop()
-            # print(f"new node popped:{t}")
 
-            t0 = time.time()
-            # print(f"elas:{t0 -self.start_time}")
-            if t0 - self.start_time > self.time_limit:
+            if time.time() - self.start_time > self.time_limit:
                 self.TLE = True
                 return
 
             self.node_count += 1
 
-            # ====== 全透视追踪 1：节点弹出 ======
-            print(
-                f"\n🟢 [POP] Node #{self.node_count} | Stack剩余: {len(stack)} | Cost: {self.model.cost_of_set(t.s):.2f}/{self.model.budget}")
-            print(f"   => 当前集合 S: {t.s}")
-            # ====================================
+            if self.verbose:
+                print(
+                    f"\n🟢 [POP] Node #{self.node_count} | Stack剩余: {len(stack)} | "
+                    f"Cost: {self.model.cost_of_set(t.s):.2f}/{self.model.budget}"
+                )
+                print(f"   => 当前集合 S: {t.s}")
 
-            # 1. Pruning/Base Case Checks
+            # 1. Pruning / base-case checks
             if len(t.candidate) == 0:
                 continue
 
             if self.is_on_the_edge(t):
                 continue
 
-            # 2. Local Greedy search and Lower Bound update
-            s_primal, f_local, c = self.greedy_add(t)
+            # 2. Local greedy search and lower-bound update
+            s_primal, f_local, c, g_prefix = self.greedy_add(t)
 
             if self.TLE:
                 return
 
-            # ====== 全透视追踪 2：LB 更新 ======
-            if self.g(s_primal) > self.lb_star:
-                print(
-                    f"   ├── 🌟 [LB 突破!] 发现新全局最优解! 收益: {self.g(s_primal):.4f} (原为 {self.lb_star:.4f})")
-                self.lb_star = self.g(s_primal)
-
-            print(
-                f"   ├── [EVAL] 启发序列 c 长度: {len(c)} | 局部上限(UB): {f_local:.4f} | 当前最优 LB: {self.lb_star:.4f}")
-            # ====================================
-
-            if self.g(s_primal) > self.lb_star:
-                self.lb_star = self.g(s_primal)
+            primal_val = self.g(s_primal)
+            if primal_val > self.lb_star:
+                if self.verbose:
+                    print(
+                        f"   ├── 🌟 [LB 突破!] 发现新全局最优解! 收益: {primal_val:.4f} "
+                        f"(原为 {self.lb_star:.4f})"
+                    )
+                self.lb_star = primal_val
                 self.s_star = s_primal
 
-            # print(f"current lb_star:{self.lb_star}")
+            if self.verbose:
+                print(
+                    f"   ├── [EVAL] 启发序列 c 长度: {len(c)} | 局部上限(UB): {f_local:.4f} | "
+                    f"当前最优 LB: {self.lb_star:.4f}"
+                )
 
-            # 3. Upper Bound Pruning
-            ub = f_local
-            # if self.alpha * ub <= self.lb_star:
-            #     # Update timing before continuing to next node
-            #     self.time_for_stage_0 += time.time() - t0
-            #     continue
-            if self.alpha * ub <= self.lb_star:
-                # ====== 全透视追踪 3：节点被剪 ======
-                print(f"   └── ❌ [KILLED] 剪枝生效! 节点已被抹杀。")
-                # ====================================
-                # Update timing before continuing to next node
-                self.time_for_stage_0 += time.time() - t0
+            # 3. Upper-bound pruning
+            if self.alpha * f_local <= self.lb_star:
+                if self.verbose:
+                    print(f"   └── ❌ [KILLED] 剪枝生效! 节点已被抹杀。")
                 continue
 
-            # ====== 全透视追踪 4：节点存活 ======
-            print(f"   └── ✅ [SURVIVED] 界限达标，准备展开多叉分支...")
-            # ====================================
+            if self.verbose:
+                print(f"   └── ✅ [SURVIVED] 界限达标，准备展开多叉分支...")
 
-            t1 = time.time()
+            # 4. Branching (reuse cached ``g_prefix`` to avoid recomputing objectives)
+            children = self.get_children(t, c, g_prefix=g_prefix)
 
-            # 4. Branching
-            children = self.get_children(t, c)
-            t2 = time.time()
-
-            # 5. Statistics and Scheduling
-            self.time_for_stage_0 += t1 - t0
-            self.time_for_stage_1 += t2 - t1
             self.children_count += len(children)
 
-            # Add children to the stack to be processed in future iterations
-            # reverse the children list before adding to stack to maintain the order
+            # Push in reverse so the first ``children`` entry is popped first (DFS).
             for t_i in reversed(children):
-                # print(f"child {t_i} pushed")
                 stack.append(t_i)
 
     def optimize(self):
@@ -1642,7 +1608,9 @@ class BFSTC(OptimalAlg):
         super().__init__(model)
         self.max_heap = None
         self.f = self.f_with_alpha
-        self.h = None
+        # NB: do NOT shadow ``self.h`` with ``None`` here. The base class ``OptimalAlg.h``
+        # provides the ``is_on_the_edge`` guard so the early-exit ``self.h(node) == 0``
+        # check below actually fires; setting ``self.h = self.inner_h`` would skip that.
         self.heap_class = 'simple'
 
         self.start_time = 0
@@ -1656,7 +1624,6 @@ class BFSTC(OptimalAlg):
             self.max_heap = SimpleMaxHeap()
 
         self.max_heap.clear()
-        self.h = self.inner_h
 
     def greedy_add_plain(self, s):
         base = s
@@ -1749,18 +1716,31 @@ class BFSTC(OptimalAlg):
 
         s_max = self.greedy_add([])
         if self.TLE:
-            ret = {'S': [], 'c(S)': 0, 'f(S)': 0, 'TLE': self.TLE,
-                   'time': time.time() - self.start_time, 'node_count': 0, "open_list_count": 0}
+            # Preserve the partial greedy result on TLE instead of returning ``S=[]``;
+            # ``greedy_add`` returns ``list(sol)`` even after timing out, and that's
+            # the best feasible solution we have at this point.
+            ret = {'S': list(s_max),
+                   'c(S)': self.model.cost_of_set(list(s_max)),
+                   'f(S)': self.model.objective(list(s_max)) if s_max else 0,
+                   'TLE': self.TLE,
+                   'time': time.time() - self.start_time,
+                   'node_count': 0, "open_list_count": 0}
 
             return ret
 
-        g_upper = self.h(root)
+        # Sound upper bound on OPT: g(node) + h(node).
+        # The previous formulation ``f(node)/alpha = g/alpha + h`` was a valid but loose
+        # bound (alpha < 1 inflates ``g``), which delayed the alpha-pruning trigger.
+        g_upper = self.g(root) + self.h(root)
         self.max_heap.push(root)
 
         sol = s_max
         node_count = 0
         open_list_count = 0
-        while self.max_heap.size() > 0:
+        # Once the alpha-feasible sol = s_max has been certified, stop popping; further
+        # pops could overwrite ``sol`` via the ``self.h(node) == 0`` branch.
+        sol_certified = False
+        while self.max_heap.size() > 0 and not sol_certified:
             node: BaseHeapObj = self.max_heap.pop()
             node_count += 1
 
@@ -1772,7 +1752,7 @@ class BFSTC(OptimalAlg):
                 sol = node.s
                 break
 
-            g_upper = min(g_upper, self.f(node) / self.alpha)
+            g_upper = min(g_upper, self.g(node) + self.h(node))
 
             for i in node.candidate:
                 if self.model.cost_of_singleton(i) <= node.budget:
@@ -1783,9 +1763,9 @@ class BFSTC(OptimalAlg):
                     if self.g(s_max) < self.g(s_final):
                         s_max = s_final
 
-                    if self.g(s_max) / g_upper >= self.alpha:
+                    if self.g(s_max) >= self.alpha * g_upper:
                         sol = s_max
-                        # print(f"sol:{s_max}, upper:{g_upper}")
+                        sol_certified = True
                         break
 
                     new_node = BaseHeapObj(set(node.s) | {i}, candidate=set(node.candidate) - {i}, budget=node.budget - self.model.cost_of_singleton(i))

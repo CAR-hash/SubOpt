@@ -9,8 +9,8 @@ import testlogger
 
 import numpy as np
 
+import algorithm_factory
 import compute_efficient_config
-import efficient_bfs
 import model_factory
 
 
@@ -38,7 +38,7 @@ def _wrap_result_with_meta(
         "archive": str(cfg.archive),
         "seed": int(seed),
         "ground_size": int(cfg.num),
-        "algorithm": "AdaptiveEfficientBFS" if cfg.adaptive else "EfficientBFS",
+        "algorithm": cfg.algorithm,
         "strategy": strategy_name_for_file,
         "strategy_raw": strategy_raw,
         "heuristic": heuristic,
@@ -50,6 +50,7 @@ def _wrap_result_with_meta(
             "local_search": bool(cfg.local_search),
             "no_inherit": bool(cfg.no_inherit),
             "cascade": bool(cfg.cascade),
+            # Kept for back-compat with older readers; ``algorithm`` is the source of truth.
             "adaptive": bool(cfg.adaptive),
         },
         "adaptive_ratio": float(cfg.adaptive_ratio),
@@ -110,51 +111,53 @@ if __name__ == "__main__":
 
         root_dir = os.path.join("./result", f"archive-{cfg.archive}")
 
-        print(f"[START] Experiments | Task: {cfg.task} | Strategies: {cfg.branching}")
+        # Algorithms without a branching dimension still need to run once per
+        # (seed, budget, heuristic); use a single placeholder strategy so the loop
+        # below stays uniform.
+        if cfg.supports_branching:
+            strategies_for_loop = list(cfg.branching)
+        else:
+            # Filesystem-safe placeholder (no slashes); BFSTC/EBB don't use branching.
+            strategies_for_loop = ["none"]
+            if cfg.branching:
+                print(
+                    f"[INFO] Algorithm {cfg.algorithm!r} does not use 'branching'; "
+                    f"ignoring configured value {cfg.branching}."
+                )
+
+        print(f"[START] Experiments | Task: {cfg.task} | Algorithm: {cfg.algorithm} | Strategies: {strategies_for_loop}")
 
         for seed in range(cfg.start_seed, cfg.stop_seed):
             for budget in bds:
 
                 print(f"\n--- Task {cfg.task!r} | Seed: {seed:02d} | Budget: {budget:4.1f} ---")
 
-                for strategy in cfg.branching:
+                for strategy in strategies_for_loop:
                     for heuristic in cfg.heuristics:
                         log_dir = f"./result/archive-{cfg.archive}/{cfg.task}/"
                         os.makedirs(log_dir, exist_ok=True)
-                        log_prefix = f"Adapt{cfg.adaptive_ratio}_" if cfg.adaptive else ""
+                        log_prefix = f"Adapt{cfg.adaptive_ratio}_" if cfg.algorithm == "AdaptiveEfficientBFS" else ""
+                        log_strategy_token = strategy if cfg.supports_branching else cfg.algorithm
                         log_path = os.path.join(
-                            log_dir, f"{log_prefix}{strategy}_{budget}_{heuristic}_log.txt")
+                            log_dir, f"{log_prefix}{log_strategy_token}_{budget}_{heuristic}_log.txt")
 
                         with testlogger.TeeLogger(log_path):
                             random.seed(seed)
 
                             model = model_factory.model_factory(cfg.task, cfg.num, seed, budget, knap=True)
 
-                            if cfg.adaptive:
-                                alg = efficient_bfs.AdaptiveEfficientBFS(model)
-                                alg.adaptive_ratio = cfg.adaptive_ratio
-                            else:
-                                alg = efficient_bfs.EfficientBFS(model)
-
-                            alg.use_alpha = True
-                            alg.local_search = cfg.local_search
-                            alg.alpha = cfg.alpha
-                            alg.set_d(cfg.sorting)
-                            alg.configure_upper_bound(heuristic)
-                            alg.configure_aux_upper_bound(cfg.aux_heuristic)
-                            alg.inherit_bounds = not cfg.no_inherit
-                            if cfg.cascade:
-                                alg.use_cascade = True
+                            alg = algorithm_factory.build_algorithm(
+                                cfg, model=model, heuristic=heuristic, strategy=strategy,
+                            )
 
                             strategy_name_for_file = strategy
-                            if cfg.local_search:
-                                strategy_name_for_file += "_LS"
-                            if cfg.no_inherit:
-                                strategy_name_for_file += "_NoInh"
+                            if cfg.supports_branching:
+                                if cfg.local_search:
+                                    strategy_name_for_file += "_LS"
+                                if cfg.no_inherit:
+                                    strategy_name_for_file += "_NoInh"
 
-                            alg.branching_strategy = strategy
-
-                            if cfg.opt_solve_log:
+                            if cfg.opt_solve_log and hasattr(alg, "opt_solve_log_path"):
                                 alg.opt_solve_log_path = cfg.opt_solve_log
                                 alg.opt_solve_log_meta = {
                                     "task": cfg.task,
@@ -172,20 +175,24 @@ if __name__ == "__main__":
                             function_val = res.get('f(S)', 0.0)
                             print(f"trigger count:{res.get('probing_trigger_count', 0)}, depth_list:{res.get('probing_trigger_depth_list', [])}, max_depth:{res.get('max_depth', 0)}")
                             if not res.get('TLE', False):
-                                print(f"  [OK] Strategy: {strategy_name_for_file:<14s} | h:{heuristic:<4s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | Time: {time_cost:.2f}s")
+                                print(f"  [OK] Algo: {cfg.algorithm} | Strategy: {strategy_name_for_file:<14s} | h:{heuristic:<4s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | Time: {time_cost:.2f}s")
                             else:
-                                print(f"  [TLE] Strategy: {strategy_name_for_file:<14s} | h:{heuristic:<4s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | TLE: {time_cost:.2f}s")
+                                print(f"  [TLE] Algo: {cfg.algorithm} | Strategy: {strategy_name_for_file:<14s} | h:{heuristic:<4s} | f(S):{function_val} | Nodes: {node_cnt:<6d} | TLE: {time_cost:.2f}s")
 
                             save_dir = os.path.join(root_dir, cfg.task, str(cfg.num), str(seed))
                             os.makedirs(save_dir, exist_ok=True)
 
-                            filename = "EfficientBFS-{}-{}-{}-{}-{}-{}.pckl".format(
+                            # Filename embeds the algorithm name so siblings from different
+                            # algorithms don't collide. Metadata in the pickle remains the
+                            # source of truth for downstream parsing.
+                            filename = "{}-{}-{}-{}-{}-{}-{}.pckl".format(
+                                cfg.algorithm,
                                 strategy_name_for_file,
                                 heuristic,
                                 cfg.sorting,
                                 budget,
                                 cfg.alpha,
-                                model.__class__.__name__
+                                model.__class__.__name__,
                             )
                             save_path = os.path.join(save_dir, filename)
 
