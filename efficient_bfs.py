@@ -169,6 +169,12 @@ class EfficientBFS(OptimalAlg):
 
         self.search_observer: SearchObserver = PrintingSearchObserver()
 
+        # Unified per-run event logger. ``compute_efficient.py`` overrides this with a
+        # configured :class:`runlog.RunLogger` carrying run-level metadata (run_id);
+        # the default is a no-op so library users are never noisy by accident.
+        from runlog import NullRunLogger as _NullRL
+        self.runlog = _NullRL()
+
         # Per ``opt.solve`` timing (LazyPlain / LazySlicing); see :meth:`get_optimizer` / ``compute_efficient`` JSON ``opt_solve_log``.
         self.opt_solve_log_path = None
         self.opt_solve_log_meta = None  # optional dict: task, seed, budget, branching, heuristic_cli
@@ -312,25 +318,39 @@ class EfficientBFS(OptimalAlg):
             if self.alpha * f_fast <= self.g(self.s_max):
                 return None  # 被 ub0 秒杀，节省了计算 ub2 的巨量时间
 
-        # 第二段：初筛没杀掉，或者没开启级联，执行正式评估
-        t_start_h = time.perf_counter()  # 添加开始
+        # Stage 2: full UB evaluation (cascade did not prune, or cascade is off).
+        t_start_h = time.perf_counter()
         new_h = self.h(node)
-        t_end_h = time.perf_counter()  # 添加结束
-        self._obs_timer("push_heap -> self.h(node) 耗时", t_end_h - t_start_h)
+        t_end_h = time.perf_counter()
+        self._obs_timer("push_heap.h", t_end_h - t_start_h)
         final_v = new_g + new_h
 
-        # ====== 全透视追踪：界限评估 ======
-        self._obs_log("push_heap_eval", f"  ├── [EVAL] 评估子节点 S: {s}")
-        self._obs_log("push_heap_eval", f"  │   ├── g(S): {new_g:.2f} | h(S): {new_h:.2f} | 原始 UB: {final_v:.2f}")
+        # Verbose UB evaluation trace (kept ASCII-only for log parsers).
+        self._obs_log("push_heap_eval", f"  [EVAL] s={s}")
+        self._obs_log("push_heap_eval", f"    g={new_g:.2f} h={new_h:.2f} ub={final_v:.2f}")
         self._obs_log("push_heap_eval",
-                      f"  │   └── 对比条件: min(UB, f_local:{f_local:.2f}) * alpha:{self.alpha} <= s_max_v:{s_max_v:.2f}")
+                      f"    test min(ub,f_local={f_local:.2f}) * alpha={self.alpha} <= s_max_v={s_max_v:.2f}")
+
+        parent_tree_id = int(getattr(self, "_current_parent_tree_id", 0))
 
         if min(final_v, f_local) * self.alpha <= self.g(self.s_max):
-            self._obs_log("push_heap_eval", "  │   └── ❌ [KILLED] 剪枝生效，节点已被抹杀。")
+            self._obs_log("push_heap_eval", "    [KILLED] node pruned by alpha-LB test")
+            from runlog import fmt_set as _fmt_set
+            pre_id = self.runlog.next_node_id()
+            self.runlog.node_push(
+                parent_id=parent_tree_id,
+                id=int(pre_id),
+                s=_fmt_set(s),
+                ub=float(min(final_v, f_local)),
+                status="pruned_pre",
+                depth=int(depth),
+            )
+            self.runlog.node_prune(reason="alpha_lb", ub=float(min(final_v, f_local)),
+                                   lb=float(self.g(self.s_max)),
+                                   id=int(pre_id))
             return None
 
-        self._obs_log("push_heap_eval", "  │   └── ✅ [SURVIVED] 界限达标，准备入堆！")
-        # ===============================
+        self._obs_log("push_heap_eval", "    [SURVIVED] node survived; pushing to heap")
 
         # 2. 统一进行界限判定和 Alpha 剪枝
         if final_v >= s_max_v:
@@ -351,6 +371,16 @@ class EfficientBFS(OptimalAlg):
                 v = RefinedBFSValue(new_ub, lbd_v, self.d(s))
 
             node.v = v
+            node.tree_id = self.runlog.next_node_id()
+            from runlog import fmt_set as _fmt_set
+            self.runlog.node_push(
+                parent_id=parent_tree_id,
+                id=int(node.tree_id),
+                s=_fmt_set(s),
+                ub=float(lbd_v),
+                status="pushed",
+                depth=int(depth),
+            )
             self.max_heap.push(node)
             return node
 
@@ -449,13 +479,15 @@ class EfficientBFS(OptimalAlg):
         root.cost = 0
         root.depth = 0
         root.forbidden_sets = []
+        # Root tree id is conventionally 0; children get monotonic ids from runlog.
+        root.tree_id = 0
 
         f_upper = self.f(root)
 
         t_start_root = time.perf_counter()
         s_max, f_local, heuristic_sequence = self.greedy_add(root)
         t_end_root = time.perf_counter()
-        self._obs_timer("首次 greedy_add 耗时", t_end_root - t_start_root)
+        self._obs_timer("root.greedy_add", t_end_root - t_start_root)
 
         v = RefinedBFSValue(self.f(root), f_upper, self.d(root.s))
         root.v = v
@@ -493,7 +525,7 @@ class EfficientBFS(OptimalAlg):
 
     def branching_lazy_binary(self, node, heuristic_sequence):
         """
-        基于惰性评估 (Lazy Evaluation) 的极速双叉分支 (带全透视日志)
+        Lazy-evaluation binary branching with verbose UB tracing.
         """
         if not heuristic_sequence:
             return 0
@@ -503,62 +535,67 @@ class EfficientBFS(OptimalAlg):
         current_lb = self.g(self.s_max)
         open_list_change = 0
 
-        # 1. 初始化惰性评估器 (继承父节点状态)
-        t_start_lazy_build = time.perf_counter()  # 添加开始
+        # 1. Initialize lazy optimizer (inherits parent state).
+        t_start_lazy_build = time.perf_counter()
         opt = self._get_aux_optimizer()
         opt.build(base=set(node.s), remaining=set(node.candidate))
-        t_end_lazy_build = time.perf_counter()  # 添加结束
-        self._obs_timer("lazy_binary -> opt.build 耗时", t_end_lazy_build - t_start_lazy_build)
+        t_end_lazy_build = time.perf_counter()
+        self._obs_timer("lazy_binary.opt.build", t_end_lazy_build - t_start_lazy_build)
 
-        # ==========================================================
-        # A. 右分支 (不选 e1)
-        # ==========================================================
+        # ----------------------------------------------------------
+        # A. Right branch (exclude e1).
+        # ----------------------------------------------------------
         right_cand = list(set(node.candidate) - {e1})
-        t_start_lazy_solve_r = time.perf_counter()  # 添加开始
+        t_start_lazy_solve_r = time.perf_counter()
         ub_delta_right = opt.solve(remaining_set=set(right_cand), budget=node.budget)
         ub_right = self.model.objective(node.s) + ub_delta_right
-        t_end_lazy_solve_r = time.perf_counter()  # 添加结束
-        self._obs_timer("lazy_binary -> opt.solve (右分支) 耗时", t_end_lazy_solve_r - t_start_lazy_solve_r)
+        t_end_lazy_solve_r = time.perf_counter()
+        self._obs_timer("lazy_binary.opt.solve.right", t_end_lazy_solve_r - t_start_lazy_solve_r)
 
         if self.alpha * ub_right > current_lb:
             self._obs_log("lazy_binary",
-                          f"      ├── 🌿 [BRANCH] 生成右分支(不选) S: {list(node.s)} | 排除: {e1} | UB: {ub_right:.4f}")
+                          f"      [BRANCH right exclude={e1}] s={list(node.s)} ub={ub_right:.4f}")
             (self.push_child().precomputed_ub(ub_right).s(list(node.s)).candidate(right_cand)
              .w(node.budget).depth(node.depth + 1).execute())
             open_list_change += 1
+            self.runlog.node_branch(children=1, strategy="lazy_binary_right")
         else:
             self._obs_log("lazy_binary",
-                          f"      ├── ✂️ [PRUNED] 丢弃右分支(不选) S: {list(node.s)} | 排除: {e1} | UB: {ub_right:.4f} <= LB")
+                          f"      [PRUNED right exclude={e1}] s={list(node.s)} ub={ub_right:.4f} <= lb")
+            self.runlog.node_prune(reason="lazy_binary_right_ub", ub=float(ub_right),
+                                   lb=float(current_lb))
 
-        # ==========================================================
-        # B. 左分支 (选 e1)
-        # ==========================================================
+        # ----------------------------------------------------------
+        # B. Left branch (include e1).
+        # ----------------------------------------------------------
         if node.budget >= cost_e1:
             left_s = list(set(node.s) | {e1})
             left_cand = list(set(node.candidate) - {e1})
             left_budget = node.budget - cost_e1
 
-            # 【极速 O(1) 增量】
+            # O(1) incremental update of the base.
             opt.update_base(set(left_s))
             ub_delta_left = opt.solve(remaining_set=set(left_cand), budget=left_budget)
             ub_left = self.model.objective(left_s) + ub_delta_left
 
             if self.alpha * ub_left > current_lb:
                 self._obs_log("lazy_binary",
-                              f"      ├── 🌿 [BRANCH] 生成左分支(选入) S: {left_s} | 新增: {e1} | UB: {ub_left:.4f}")
+                              f"      [BRANCH left include={e1}] s={left_s} ub={ub_left:.4f}")
                 (self.push_child().precomputed_ub(ub_left).s(left_s).candidate(left_cand).w(left_budget)
                  .depth(node.depth + 1).heuristic_sequence(heuristic_sequence[1:]).execute())
                 open_list_change += 1
+                self.runlog.node_branch(children=1, strategy="lazy_binary_left")
             else:
                 self._obs_log("lazy_binary",
-                              f"      ├── ✂️ [PRUNED] 丢弃左分支(选入) S: {left_s} | 新增: {e1} | UB: {ub_left:.4f} <= LB")
+                              f"      [PRUNED left include={e1}] s={left_s} ub={ub_left:.4f} <= lb")
+                self.runlog.node_prune(reason="lazy_binary_left_ub", ub=float(ub_left),
+                                       lb=float(current_lb))
 
         return open_list_change
 
     def push_heap_with_ub(self, s, candidate, w, depth, pre_computed_ub, heuristic_sequence=None):
         """
-        专为惰性评估设计的入堆方法。
-        直接接收算好的上界，绝对不再调用昂贵的 self.h() 重算。
+        Lazy-evaluation push that takes a pre-computed UB instead of calling ``self.h()``.
         """
         node = EfficientBFSHeapObj(
             s=s,
@@ -568,13 +605,22 @@ class EfficientBFS(OptimalAlg):
             max_idx=0
         )
         v = RefinedBFSValue(pre_computed_ub, pre_computed_ub, self.d(s))
-        # 强行注入预先算好的极速上界
         node.v = v
         node.cost = self.model.budget - w
         node.depth = depth
         node.heuristic_sequence = heuristic_sequence
 
-        # 直接推入你重写过容差比较逻辑的 SimpleMaxHeap
+        node.tree_id = self.runlog.next_node_id()
+        from runlog import fmt_set as _fmt_set
+        self.runlog.node_push(
+            parent_id=int(getattr(self, "_current_parent_tree_id", 0)),
+            id=int(node.tree_id),
+            s=_fmt_set(s),
+            ub=float(pre_computed_ub),
+            status="pushed",
+            depth=int(depth),
+        )
+
         self.max_heap.push(node)
 
     def branching_with_injection(self, node, heuristic_sequence, tau=0.85, max_k=3):
@@ -873,15 +919,14 @@ class EfficientBFS(OptimalAlg):
                 left_cand.remove(clone)  # 左分支：选了 e1，就不选克隆体 (互斥)
                 right_cand.remove(clone)  # 右分支：连 e1 都不选，更不可能选它的克隆体 (对称性破缺)
 
-        # ====== 插入点 1：监测坍缩命中情况 ======
+        # Only emit cluster-collapse hits for shallow depths to avoid log flooding.
         if removed_clones_count > 0 and node.depth < 5:
-            # 只打印浅层（前 5 层）的坍缩，防止深层日志刷屏
             self._obs_log(
                 "cluster_collapse",
-                f"💥 [Cluster Collapse] Depth: {node.depth} | 选定主节点: {e1} | 成功物理超度了 {removed_clones_count} 个克隆体!")
+                f"[ClusterCollapse] depth={node.depth} primary={e1} removed_clones={removed_clones_count}")
             self._obs_log(
                 "cluster_collapse",
-                f"   -> 剔除的元素可能导致了虚高 UB，当前左分支剩余候选集大小: {len(left_cand)}")
+                f"   left_cand_size={len(left_cand)}")
             self._obs_metric("cluster_collapse.removed_clones", float(removed_clones_count), depth=node.depth)
         # ====================================
 
@@ -1106,11 +1151,27 @@ class EfficientBFS(OptimalAlg):
         t_start_root = time.perf_counter()
         root, f_upper, heuristic_sequence, self.s_max = self.push_root()
         t_end_root = time.perf_counter()
-        self._obs_timer("push_root (含首次 greedy_add) 耗时", t_end_root - t_start_root)
+        self._obs_timer("push_root", t_end_root - t_start_root)
+        from runlog import fmt_set as _fmt_set
+        self.runlog.greedy_done(
+            f_s=float(self.g(self.s_max)),
+            set_size=len(self.s_max),
+            s=_fmt_set(self.s_max),
+        )
 
         if self.g(self.s_max) >= self.alpha * f_upper:
             stop_time = time.time()
             sol = self.s_max
+            from runlog import fmt_set as _fmt_set
+            self.runlog.run_end(
+                status="OK",
+                f_s=float(self.model.objective(sol)),
+                c_s=float(self.model.cost_of_set(sol)),
+                nodes=1,
+                time_s=stop_time - start_time,
+                early_exit=True,
+                final_s=_fmt_set(sol),
+            )
             return {'S': sol, 'c(S)': self.model.cost_of_set(sol), 'f(S)': self.model.objective(sol),
                     'time': stop_time - start_time, 'node_count': 1, "open_list_count": 1,
                     'push_back_count': 0, 'probing_trigger_count': 0, 'probing_depth_list': [],
@@ -1118,7 +1179,17 @@ class EfficientBFS(OptimalAlg):
 
         ctx = BfsSearchContext(self, start_time, f_upper)
         self._bfs_main_loop(ctx)
-        return self._bfs_pack_result(ctx)
+        result = self._bfs_pack_result(ctx)
+        from runlog import fmt_set as _fmt_set
+        self.runlog.run_end(
+            status="TLE" if result.get("TLE") else "OK",
+            f_s=float(result["f(S)"]),
+            c_s=float(result["c(S)"]),
+            nodes=int(result["node_count"]),
+            time_s=float(result["time"]),
+            final_s=_fmt_set(result["S"]),
+        )
+        return result
 
     def _bfs_main_loop(self, ctx: BfsSearchContext):
         while ctx.should_continue():
@@ -1136,10 +1207,22 @@ class EfficientBFS(OptimalAlg):
     def _bfs_on_node_popped(self, node, ctx: BfsSearchContext):
         self._obs_log(
             "pop",
-            f"\n🟢 [POP] Node #{ctx.node_count} | Depth: {node.depth} | Cost: {node.cost}/{ctx.model.budget} | UB: {node.v.lbd_v:.2f}")
-        self._obs_log("pop", f"   => 当前集合 S: {node.s}")
-        self._obs_log("pop", f"   => 剩余候选集大小: {len(node.candidate)}")
+            f"\n[POP] node={ctx.node_count} depth={node.depth} cost={node.cost}/{ctx.model.budget} ub={node.v.lbd_v:.2f}")
+        self._obs_log("pop", f"   s={node.s}")
+        self._obs_log("pop", f"   candidates_left={len(node.candidate)}")
         self._obs_metric("search.node_pop", float(ctx.node_count), depth=node.depth, ub=float(node.v.lbd_v))
+        from runlog import fmt_set as _fmt_set
+        self.runlog.node_pop(
+            node=int(ctx.node_count),
+            open=int(len(ctx.max_heap)) if hasattr(ctx.max_heap, "__len__") else -1,
+            s_size=len(node.s),
+            cost=float(node.cost),
+            budget=float(ctx.model.budget),
+            ub=float(node.v.lbd_v),
+            depth=int(node.depth),
+            id=int(getattr(node, "tree_id", 0)),
+            s=_fmt_set(node.s),
+        )
 
     def _bfs_update_max_depth(self, node):
         if self.max_depth < node.depth:
@@ -1160,7 +1243,7 @@ class EfficientBFS(OptimalAlg):
                 t_start_greedy = time.perf_counter()
                 s_final, f_local, heuristic_sequence = self.greedy_add(node)
                 t_end_greedy = time.perf_counter()
-                self._obs_timer("greedy_add 耗时", t_end_greedy - t_start_greedy)
+                self._obs_timer("greedy_add", t_end_greedy - t_start_greedy)
 
                 if not ctx.timer_proxy.is_active:
                     return "break"
@@ -1170,17 +1253,34 @@ class EfficientBFS(OptimalAlg):
                     old_lb = ctx.current_lb()
                     self._obs_log(
                         "lb",
-                        f"🌟 [LB 突破!] 树深度: {node.depth} | 新的全局最优 LB: {ctx.g(s_final):.4f} (原为 {old_lb:.4f})")
+                        f"[LB+] depth={node.depth} new_lb={ctx.g(s_final):.4f} prev={old_lb:.4f}")
                     self._obs_metric("search.lb", float(ctx.g(s_final)), depth=node.depth, old_lb=float(old_lb))
+                    from runlog import fmt_set as _fmt_set
+                    self.runlog.incumbent(
+                        f_s=float(ctx.g(s_final)),
+                        prev=float(old_lb),
+                        set_size=len(s_final),
+                        depth=int(node.depth),
+                        s=_fmt_set(s_final),
+                    )
                     ctx.s_max = s_final
 
                 if ctx.local_search:
                     if ctx.g(s_final) > 0.98 * ctx.current_lb():
                         enhanced_s, enhanced_val = self.fast_local_swap_hs(ctx.s_max, heuristic_sequence)
                         if enhanced_val > ctx.current_lb():
+                            old_lb_ls = ctx.current_lb()
                             ctx.s_max = enhanced_s
-                            self._obs_log("local_search", f"🚀 [LS Hit] Improved global LB to {enhanced_val:.2f}")
+                            self._obs_log("local_search", f"[LS+] new_lb={enhanced_val:.2f}")
                             self._obs_metric("search.local_search_lb", float(enhanced_val))
+                            from runlog import fmt_set as _fmt_set
+                            self.runlog.incumbent(
+                                f_s=float(enhanced_val),
+                                prev=float(old_lb_ls),
+                                set_size=len(enhanced_s),
+                                source="local_search",
+                                s=_fmt_set(enhanced_s),
+                            )
 
             if ctx.branching_strategy != 'fullbab' and min(node.v.lbd_v, f_local) * ctx.alpha <= ctx.current_lb():
                 return None
@@ -1197,9 +1297,16 @@ class EfficientBFS(OptimalAlg):
     def _bfs_apply_branching(self, ctx: BfsSearchContext, node, heuristic_sequence, f_local):
         t_start_branch = time.perf_counter()
         strategy = get_branching_strategy(ctx.branching_strategy)
-        strategy.branch(self, node, heuristic_sequence, f_local)
+        # Surface the parent's tree id to ``push_heap`` / ``push_heap_with_ub`` so the
+        # NODE_PUSH events emitted from inside the strategy carry the right parent_id.
+        prev_parent = getattr(self, "_current_parent_tree_id", 0)
+        self._current_parent_tree_id = int(getattr(node, "tree_id", 0))
+        try:
+            strategy.branch(self, node, heuristic_sequence, f_local)
+        finally:
+            self._current_parent_tree_id = prev_parent
         t_end_branch = time.perf_counter()
-        self._obs_timer(f"策略 {ctx.branching_strategy} 整体执行耗时", t_end_branch - t_start_branch)
+        self._obs_timer(f"branch.{ctx.branching_strategy}", t_end_branch - t_start_branch)
         self._obs_metric("search.branch_seconds", t_end_branch - t_start_branch, strategy=ctx.branching_strategy)
 
     def _bfs_pack_result(self, ctx: BfsSearchContext):

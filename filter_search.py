@@ -18,6 +18,9 @@ import random
 import numpy as np
 from scipy.optimize import milp, LinearConstraint, Bounds
 
+# Tree-mode logging helpers (canonical set formatting, etc.).
+import runlog as runlog_mod
+
 
 
 @total_ordering
@@ -1091,6 +1094,13 @@ class EfficientBranchAndBound(OptimalAlg):
         # tee'd to disk by ``compute_efficient.TeeLogger``).
         self.verbose = False
 
+        # Unified per-run event logger; overridden by ``compute_efficient.py``.
+        # ``runlog.verbose`` controls high-frequency events (``NODE_POP`` / ``NODE_BRANCH`` /
+        # ``NODE_PRUNE``); independent of :attr:`verbose`, which keeps the legacy plain
+        # ``print`` trace.
+        from runlog import NullRunLogger as _NullRL
+        self.runlog = _NullRL()
+
     def set_h(self, heuristic):
         # EBB does not use the node heuristic ``self.lbd`` / ``self.inner_h`` anywhere.
         # Keeping the method as a no-op so the algorithm factory can call it uniformly
@@ -1179,6 +1189,7 @@ class EfficientBranchAndBound(OptimalAlg):
         """
         children = []
         s = t.s
+        parent_tree_id = int(getattr(t, "tree_id", 0))
 
         # 1. Instantiate and build the Lazy Optimizer
         opt = acclerated_upper_bounds.LazyPlainOptimizer(self.model)
@@ -1202,10 +1213,35 @@ class EfficientBranchAndBound(OptimalAlg):
             node_ub = current_f + upper_bound_delta
             if self.alpha * node_ub > self.lb_star:
                 if self.verbose:
-                    print(f"      ├── 🌿 [BRANCH] 生成子节点 S: {list(base_set)} | 排除: {c[i]} | UB: {node_ub:.4f}")
+                    print(f"      [BRANCH exclude={c[i]}] s={list(base_set)} ub={node_ub:.4f}")
+                temp.tree_id = self.runlog.next_node_id()
+                self.runlog.node_push(
+                    parent_id=parent_tree_id,
+                    id=int(temp.tree_id),
+                    s=runlog_mod.fmt_set(temp.s),
+                    ub=float(node_ub),
+                    status="pushed",
+                    excluded=int(c[i]),
+                )
                 children.append(temp)
-            elif self.verbose:
-                print(f"      ├── ✂️ [PRUNED] 丢弃子节点 S: {list(base_set)} | 排除: {c[i]} | UB: {node_ub:.4f} <= LB")
+            else:
+                if self.verbose:
+                    print(f"      [PRUNED exclude={c[i]}] s={list(base_set)} ub={node_ub:.4f} <= lb={self.lb_star:.4f}")
+                pre_id = self.runlog.next_node_id()
+                self.runlog.node_push(
+                    parent_id=parent_tree_id,
+                    id=int(pre_id),
+                    s=runlog_mod.fmt_set(base_set),
+                    ub=float(node_ub),
+                    status="pruned_pre",
+                    excluded=int(c[i]),
+                )
+                self.runlog.node_prune(
+                    reason="child_ub",
+                    ub=float(node_ub),
+                    lb=float(self.lb_star),
+                    id=int(pre_id),
+                )
 
         # 3. Process the final child (including all elements of c)
         base_set_final = set(s) | set(c)
@@ -1221,8 +1257,34 @@ class EfficientBranchAndBound(OptimalAlg):
         else:
             current_f_final = self.model.objective(list(base_set_final))
 
-        if current_f_final + upper_bound_delta_final > self.lb_star:
+        node_ub_final = current_f_final + upper_bound_delta_final
+        if node_ub_final > self.lb_star:
+            temp.tree_id = self.runlog.next_node_id()
+            self.runlog.node_push(
+                parent_id=parent_tree_id,
+                id=int(temp.tree_id),
+                s=runlog_mod.fmt_set(temp.s),
+                ub=float(node_ub_final),
+                status="pushed",
+                excluded=-1,
+            )
             children.append(temp)
+        else:
+            pre_id = self.runlog.next_node_id()
+            self.runlog.node_push(
+                parent_id=parent_tree_id,
+                id=int(pre_id),
+                s=runlog_mod.fmt_set(base_set_final),
+                ub=float(node_ub_final),
+                status="pruned_pre",
+                excluded=-1,
+            )
+            self.runlog.node_prune(
+                reason="child_ub",
+                ub=float(node_ub_final),
+                lb=float(self.lb_star),
+                id=int(pre_id),
+            )
 
         return children
 
@@ -1247,6 +1309,9 @@ class EfficientBranchAndBound(OptimalAlg):
     def bab_stack(self, initial_node: BranchAndBoundNode):
         # Iterative DFS over the branch-and-bound tree. Replaces the (deleted) recursive
         # ``bab`` method which was unused.
+        # Tree-mode bookkeeping: the seed ``initial_node`` is the root (id = 0); its
+        # children get monotonic ids from ``runlog.next_node_id()``.
+        initial_node.tree_id = 0
         stack = [initial_node]
         while stack:
             t = stack.pop()
@@ -1257,18 +1322,36 @@ class EfficientBranchAndBound(OptimalAlg):
 
             self.node_count += 1
 
+            popped_tree_id = int(getattr(t, "tree_id", 0))
+            self.runlog.node_pop(
+                node=int(self.node_count),
+                open=int(len(stack)),
+                s_size=len(t.s),
+                cost=float(self.model.cost_of_set(t.s)),
+                budget=float(self.model.budget),
+                ub=float(self.lb_star) if self.lb_star is not None else float("inf"),
+                id=popped_tree_id,
+                s=runlog_mod.fmt_set(t.s),
+            )
+
             if self.verbose:
                 print(
-                    f"\n🟢 [POP] Node #{self.node_count} | Stack剩余: {len(stack)} | "
-                    f"Cost: {self.model.cost_of_set(t.s):.2f}/{self.model.budget}"
+                    f"\n[POP] node={self.node_count} stack={len(stack)} "
+                    f"cost={self.model.cost_of_set(t.s):.2f}/{self.model.budget}"
                 )
-                print(f"   => 当前集合 S: {t.s}")
+                print(f"   s={t.s}")
 
             # 1. Pruning / base-case checks
             if len(t.candidate) == 0:
+                self.runlog.node_prune(reason="empty_candidate", ub=0.0,
+                                       lb=float(self.lb_star) if self.lb_star is not None else 0.0,
+                                       id=popped_tree_id)
                 continue
 
             if self.is_on_the_edge(t):
+                self.runlog.node_prune(reason="edge", ub=0.0,
+                                       lb=float(self.lb_star) if self.lb_star is not None else 0.0,
+                                       id=popped_tree_id)
                 continue
 
             # 2. Local greedy search and lower-bound update
@@ -1279,33 +1362,45 @@ class EfficientBranchAndBound(OptimalAlg):
 
             primal_val = self.g(s_primal)
             if primal_val > self.lb_star:
+                prev_lb = float(self.lb_star) if self.lb_star is not None else 0.0
                 if self.verbose:
                     print(
-                        f"   ├── 🌟 [LB 突破!] 发现新全局最优解! 收益: {primal_val:.4f} "
-                        f"(原为 {self.lb_star:.4f})"
+                        f"   [LB+] new_lb={primal_val:.4f} prev={prev_lb:.4f}"
                     )
                 self.lb_star = primal_val
                 self.s_star = s_primal
+                self.runlog.incumbent(
+                    f_s=float(primal_val),
+                    prev=prev_lb,
+                    set_size=len(s_primal),
+                    s=runlog_mod.fmt_set(s_primal),
+                )
 
             if self.verbose:
                 print(
-                    f"   ├── [EVAL] 启发序列 c 长度: {len(c)} | 局部上限(UB): {f_local:.4f} | "
-                    f"当前最优 LB: {self.lb_star:.4f}"
+                    f"   [EVAL] heuristic_seq_len={len(c)} f_local={f_local:.4f} "
+                    f"lb={self.lb_star:.4f}"
                 )
 
             # 3. Upper-bound pruning
             if self.alpha * f_local <= self.lb_star:
                 if self.verbose:
-                    print(f"   └── ❌ [KILLED] 剪枝生效! 节点已被抹杀。")
+                    print(f"   [KILLED] alpha*f_local <= lb")
+                self.runlog.node_prune(reason="alpha_lb", ub=float(f_local),
+                                       lb=float(self.lb_star),
+                                       id=popped_tree_id)
                 continue
 
             if self.verbose:
-                print(f"   └── ✅ [SURVIVED] 界限达标，准备展开多叉分支...")
+                print(f"   [SURVIVED] expanding children")
 
             # 4. Branching (reuse cached ``g_prefix`` to avoid recomputing objectives)
             children = self.get_children(t, c, g_prefix=g_prefix)
 
             self.children_count += len(children)
+            if children:
+                self.runlog.node_branch(children=len(children), strategy="ebb",
+                                        parent_id=popped_tree_id)
 
             # Push in reverse so the first ``children`` entry is popped first (DFS).
             for t_i in reversed(children):
@@ -1313,6 +1408,12 @@ class EfficientBranchAndBound(OptimalAlg):
 
     def optimize(self):
         self.start_time = time.time()
+        # Bootstrap incumbent reported once via the unified format (lb_star starts at 0).
+        self.runlog.greedy_done(
+            f_s=float(self.lb_star or 0.0),
+            set_size=len(self.s_star or []),
+            s=runlog_mod.fmt_set(self.s_star or []),
+        )
         self.bab_stack(BranchAndBoundNode(self.s_star, self.model.ground_set, self.model.budget))
         stop_time = time.time()
 
@@ -1326,6 +1427,15 @@ class EfficientBranchAndBound(OptimalAlg):
             'children_count': self.children_count
         }
 
+        self.runlog.run_end(
+            status="TLE" if self.TLE else "OK",
+            f_s=float(ret['f(S)']),
+            c_s=float(ret['c(S)']),
+            nodes=int(ret['node_count']),
+            time_s=float(ret['time']),
+            children=int(ret['children_count']),
+            final_s=runlog_mod.fmt_set(self.s_star or []),
+        )
         return ret
 
 
@@ -1617,6 +1727,11 @@ class BFSTC(OptimalAlg):
         self.time_limit = 5000
         self.TLE = False
 
+        # Unified per-run event logger; overridden by ``compute_efficient.py``.
+        # See :mod:`runlog` for the event schema.
+        from runlog import NullRunLogger as _NullRL
+        self.runlog = _NullRL()
+
     def build(self):
         if self.heap_class == 'tradition':
             self.max_heap = MaxHeap()
@@ -1713,8 +1828,15 @@ class BFSTC(OptimalAlg):
 
         root = BaseHeapObj([], candidate=self.model.ground_set, budget=self.model.budget)
         root.v = self.f(root)
+        # Tree-mode bookkeeping: root id = 0; children get monotonic ids from
+        # ``runlog.next_node_id()``. Stored on the heap node so the matching
+        # ``NODE_POP`` event can correlate back to its earlier ``NODE_PUSH``.
+        root.tree_id = 0
 
         s_max = self.greedy_add([])
+        # Bootstrap incumbent reported once via the unified format.
+        f_initial = self.model.objective(list(s_max)) if s_max else 0.0
+        self.runlog.greedy_done(f_s=float(f_initial), set_size=len(s_max))
         if self.TLE:
             # Preserve the partial greedy result on TLE instead of returning ``S=[]``;
             # ``greedy_add`` returns ``list(sol)`` even after timing out, and that's
@@ -1726,6 +1848,14 @@ class BFSTC(OptimalAlg):
                    'time': time.time() - self.start_time,
                    'node_count': 0, "open_list_count": 0}
 
+            self.runlog.run_end(
+                status="TLE",
+                f_s=float(ret["f(S)"]),
+                c_s=float(ret["c(S)"]),
+                nodes=int(ret["node_count"]),
+                time_s=float(ret["time"]),
+                final_s=runlog_mod.fmt_set(s_max),
+            )
             return ret
 
         # Sound upper bound on OPT: g(node) + h(node).
@@ -1744,6 +1874,17 @@ class BFSTC(OptimalAlg):
             node: BaseHeapObj = self.max_heap.pop()
             node_count += 1
 
+            self.runlog.node_pop(
+                node=int(node_count),
+                open=int(self.max_heap.size()),
+                s_size=len(node.s),
+                cost=float(self.model.cost_of_set(node.s)),
+                budget=float(self.model.budget),
+                ub=float(self.g(node) + self.h(node)),
+                id=int(getattr(node, "tree_id", 0)),
+                s=runlog_mod.fmt_set(node.s),
+            )
+
             if time.time() - self.start_time > self.time_limit:
                 self.TLE = True
                 break
@@ -1754,6 +1895,8 @@ class BFSTC(OptimalAlg):
 
             g_upper = min(g_upper, self.g(node) + self.h(node))
 
+            children_pushed = 0
+            parent_tree_id = int(getattr(node, "tree_id", 0))
             for i in node.candidate:
                 if self.model.cost_of_singleton(i) <= node.budget:
                     s_final = self.greedy_add(set(node.s) | {i})
@@ -1761,7 +1904,14 @@ class BFSTC(OptimalAlg):
                         break
 
                     if self.g(s_max) < self.g(s_final):
+                        prev_lb = float(self.g(s_max))
                         s_max = s_final
+                        self.runlog.incumbent(
+                            f_s=float(self.g(s_max)),
+                            prev=prev_lb,
+                            set_size=len(s_max),
+                            s=runlog_mod.fmt_set(s_max),
+                        )
 
                     if self.g(s_max) >= self.alpha * g_upper:
                         sol = s_max
@@ -1770,15 +1920,36 @@ class BFSTC(OptimalAlg):
 
                     new_node = BaseHeapObj(set(node.s) | {i}, candidate=set(node.candidate) - {i}, budget=node.budget - self.model.cost_of_singleton(i))
                     new_node.v = self.f(new_node)
+                    new_node.tree_id = self.runlog.next_node_id()
+                    self.runlog.node_push(
+                        parent_id=parent_tree_id,
+                        id=int(new_node.tree_id),
+                        s=runlog_mod.fmt_set(new_node.s),
+                        ub=float(self.g(new_node) + self.h(new_node)),
+                        status="pushed",
+                        depth=len(new_node.s),
+                    )
 
                     self.max_heap.push(new_node)
                     open_list_count += 1
+                    children_pushed += 1
+
+            if children_pushed:
+                self.runlog.node_branch(children=children_pushed, strategy="bfstc")
 
         stop_time = time.time()
 
         assert sol is not None, "No solution found."
         ret = {'S': sol, 'c(S)': self.model.cost_of_set(sol), 'f(S)': self.model.objective(sol), 'TLE': self.TLE,
                'time': stop_time - self.start_time, 'node_count': node_count, "open_list_count": open_list_count}
+        self.runlog.run_end(
+            status="TLE" if self.TLE else "OK",
+            f_s=float(ret["f(S)"]),
+            c_s=float(ret["c(S)"]),
+            nodes=int(ret["node_count"]),
+            time_s=float(ret["time"]),
+            final_s=runlog_mod.fmt_set(sol),
+        )
         return ret
 
 

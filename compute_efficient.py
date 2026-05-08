@@ -12,6 +12,7 @@ import numpy as np
 import algorithm_factory
 import compute_efficient_config
 import model_factory
+import runlog
 
 
 def _wrap_result_with_meta(
@@ -166,6 +167,31 @@ if __name__ == "__main__":
                                     "branching": strategy,
                                     "heuristic_cli": heuristic,
                                 }
+
+                            # Wire the unified run logger; the algorithm emits
+                            # ``RUN_START`` / ``RUN_END`` / ``GREEDY_DONE`` / ``INCUMBENT`` etc.
+                            # ``verbose=False`` keeps high-frequency events suppressed in production.
+                            run_id = runlog.make_run_id(
+                                algorithm=cfg.algorithm,
+                                task=cfg.task,
+                                seed=int(seed),
+                                budget=float(budget),
+                                heuristic=heuristic,
+                            )
+                            run_logger = runlog.RunLogger(run_id=run_id)
+                            run_logger.run_start(
+                                algorithm=cfg.algorithm,
+                                task=cfg.task,
+                                seed=int(seed),
+                                budget=float(budget),
+                                heuristic=heuristic,
+                                alpha=float(cfg.alpha),
+                                strategy=str(strategy),
+                                archive=str(cfg.archive),
+                                ground_size=int(cfg.num),
+                            )
+                            if hasattr(alg, "runlog"):
+                                alg.runlog = run_logger
 
                             alg.build()
                             res = alg.optimize()
