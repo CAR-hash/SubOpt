@@ -1305,6 +1305,32 @@ class EfficientBranchAndBound(OptimalAlg):
 
         return children
 
+    def _ebb_emit_pop(
+        self,
+        t: BranchAndBoundNode,
+        popped_tree_id: int,
+        stack: list,
+        *,
+        ub: float,
+    ) -> None:
+        """Emit unified / legacy pop trace for one stack frame."""
+        self.runlog.node_pop(
+            node=int(self.node_count),
+            open=int(len(stack)),
+            s_size=len(t.s),
+            cost=float(self.model.cost_of_set(t.s)),
+            budget=float(self.model.budget),
+            ub=float(ub),
+            id=popped_tree_id,
+            s=runlog_mod.fmt_set(t.s),
+        )
+        if self.verbose:
+            print(
+                f"\n[POP] node={self.node_count} stack={len(stack)} "
+                f"cost={self.model.cost_of_set(t.s):.2f}/{self.model.budget} "
+                f"ub={ub:.4f}"
+            )
+            print(f"   s={t.s}")
 
     def bab_stack(self, initial_node: BranchAndBoundNode):
         # Iterative DFS over the branch-and-bound tree. Replaces the (deleted) recursive
@@ -1321,34 +1347,18 @@ class EfficientBranchAndBound(OptimalAlg):
                 return
 
             self.node_count += 1
-
             popped_tree_id = int(getattr(t, "tree_id", 0))
-            self.runlog.node_pop(
-                node=int(self.node_count),
-                open=int(len(stack)),
-                s_size=len(t.s),
-                cost=float(self.model.cost_of_set(t.s)),
-                budget=float(self.model.budget),
-                ub=float(self.lb_star) if self.lb_star is not None else float("inf"),
-                id=popped_tree_id,
-                s=runlog_mod.fmt_set(t.s),
-            )
 
-            if self.verbose:
-                print(
-                    f"\n[POP] node={self.node_count} stack={len(stack)} "
-                    f"cost={self.model.cost_of_set(t.s):.2f}/{self.model.budget}"
-                )
-                print(f"   s={t.s}")
-
-            # 1. Pruning / base-case checks
+            # 1. Pruning / base-case checks (no greedy evaluation needed).
             if len(t.candidate) == 0:
+                self._ebb_emit_pop(t, popped_tree_id, stack, ub=0.0)
                 self.runlog.node_prune(reason="empty_candidate", ub=0.0,
                                        lb=float(self.lb_star) if self.lb_star is not None else 0.0,
                                        id=popped_tree_id)
                 continue
 
             if self.is_on_the_edge(t):
+                self._ebb_emit_pop(t, popped_tree_id, stack, ub=0.0)
                 self.runlog.node_prune(reason="edge", ub=0.0,
                                        lb=float(self.lb_star) if self.lb_star is not None else 0.0,
                                        id=popped_tree_id)
@@ -1359,6 +1369,10 @@ class EfficientBranchAndBound(OptimalAlg):
 
             if self.TLE:
                 return
+
+            # Pop is logged after greedy_add so ``ub`` is the node's local upper bound
+            # (``f_local``), not the global incumbent ``lb_star``.
+            self._ebb_emit_pop(t, popped_tree_id, stack, ub=float(f_local))
 
             primal_val = self.g(s_primal)
             if primal_val > self.lb_star:

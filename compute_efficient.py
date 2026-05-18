@@ -58,6 +58,7 @@ def _wrap_result_with_meta(
     }
     return out
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run EfficientBFS experiments from a JSON config file (one or more datasets).",
@@ -170,7 +171,7 @@ if __name__ == "__main__":
 
                             # Wire the unified run logger; the algorithm emits
                             # ``RUN_START`` / ``RUN_END`` / ``GREEDY_DONE`` / ``INCUMBENT`` etc.
-                            # ``verbose=False`` keeps high-frequency events suppressed in production.
+                            # Set ``runlog_verbose`` in the JSON config to emit tree-mode events.
                             run_id = runlog.make_run_id(
                                 algorithm=cfg.algorithm,
                                 task=cfg.task,
@@ -178,7 +179,9 @@ if __name__ == "__main__":
                                 budget=float(budget),
                                 heuristic=heuristic,
                             )
-                            run_logger = runlog.RunLogger(run_id=run_id)
+                            run_logger = runlog.RunLogger(
+                                run_id=run_id, verbose=cfg.runlog_verbose,
+                            )
                             run_logger.run_start(
                                 algorithm=cfg.algorithm,
                                 task=cfg.task,
@@ -192,6 +195,10 @@ if __name__ == "__main__":
                             )
                             if hasattr(alg, "runlog"):
                                 alg.runlog = run_logger
+                            # EBB legacy ``[POP]`` / ``[EVAL]`` prints use ``alg.verbose``,
+                            # separate from ``RunLogger.verbose`` (unified NODE_* events).
+                            if cfg.runlog_verbose and hasattr(alg, "verbose"):
+                                alg.verbose = True
 
                             alg.build()
                             res = alg.optimize()

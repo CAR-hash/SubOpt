@@ -22,19 +22,19 @@ Usage
     python tools/draw_search_tree.py path/to/log.txt --max-nodes 200 --output tree.txt
     python tools/draw_search_tree.py path/to/log.txt --hide-pruned
 
-Tree-mode events are emitted only when ``RunLogger.verbose=True`` at run time;
-production ``compute_efficient.py`` runs default to ``verbose=False`` to keep logs
-small. To capture a tree, edit ``compute_efficient.py`` to construct the logger
-with ``verbose=True`` (or set the env var ``COMPUTE_EFFICIENT_TREE_LOG=1`` if you
-add that wiring) and re-run the experiment.
+Tree-mode events are emitted only when ``RunLogger.verbose=True`` at run time.
+In ``compute_efficient.py`` runs, set ``"runlog_verbose": true`` in the JSON
+config (or pass ``verbose=True`` when constructing ``RunLogger`` manually).
+Production configs default to ``false`` to keep logs small.
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sys
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Logfmt parser
@@ -72,6 +72,229 @@ def iter_events(path: str) -> Iterable[Tuple[str, Dict[str, str]]]:
             parsed = parse_event_line(raw.rstrip("\n"))
             if parsed is not None:
                 yield parsed
+
+
+# ---------------------------------------------------------------------------
+# Legacy log adapter (pre-unified ``[POP]`` / ``[EVAL]`` traces)
+# ---------------------------------------------------------------------------
+
+# ``🟢 [POP] Node #1 | Depth: 0 | Cost: 0/13.0 | UB: 652.41``
+_LEGACY_POP_ZH_RE = re.compile(
+    r"\[POP\]\s*Node\s*#(?P<node>\d+)\s*\|\s*Depth:\s*(?P<depth>\d+)\s*\|"
+    r"\s*Cost:\s*[\d.]+/[\d.]+\s*\|\s*UB:\s*(?P<ub>[\d.]+)",
+    re.IGNORECASE,
+)
+# ``[POP] node=1 depth=0 cost=0/13.0 ub=652.41``
+_LEGACY_POP_EN_RE = re.compile(
+    r"\[POP\]\s*node=(?P<node>\d+)\s+depth=(?P<depth>\d+)\s+"
+    r"cost=[\d.]+/[\d.]+\s+ub=(?P<ub>[\d.]+)",
+    re.IGNORECASE,
+)
+_LEGACY_S_ZH_RE = re.compile(r"当前集合\s*S:\s*(\[[^\]]*\])")
+_LEGACY_S_EN_RE = re.compile(r"\bs=(\[[^\]]*\])")
+_LEGACY_EVAL_RE = re.compile(
+    r"\[EVAL\].*?(?:S:\s*|s=)(\[[^\]]*\])",
+    re.IGNORECASE,
+)
+_LEGACY_UB_RE = re.compile(
+    r"(?:原始\s*UB|ub)\s*[:=]\s*([\d.]+)",
+    re.IGNORECASE,
+)
+_LEGACY_FINAL_F_RE = re.compile(r"f\(S\):([\d.]+)")
+_LEGACY_STRATEGY_RE = re.compile(r"Strategy:\s*(\S+)")
+
+
+def normalize_set(s: str) -> str:
+    """Canonical set string (sorted ints, no spaces) for matching push/pop pairs."""
+    s = s.strip()
+    if not s or s == "[]":
+        return "[]"
+    if not (s.startswith("[") and s.endswith("]")):
+        return s
+    inner = s[1:-1].strip()
+    if not inner:
+        return "[]"
+    nums = [int(x.strip()) for x in inner.split(",") if x.strip()]
+    return "[" + ",".join(str(x) for x in sorted(nums)) + "]"
+
+
+def _legacy_line_indicators(text: str) -> bool:
+    return bool(
+        re.search(r"\[POP\]", text, re.IGNORECASE)
+        or re.search(r"\[EVAL\]", text, re.IGNORECASE)
+    )
+
+
+def _unified_tree_event_kinds(events: Iterable[Tuple[str, Dict[str, str]]]) -> frozenset:
+    return frozenset(ev for ev, _ in events if ev in ("NODE_PUSH", "NODE_POP"))
+
+
+def build_tree_from_legacy(path: str) -> TreeView:
+    """
+    Reconstruct a search tree from legacy human-readable BFS logs.
+
+    Parses ``[POP]`` / ``[EVAL]`` blocks (English or localized Chinese traces) by
+    treating each pop as visiting a node and each eval block until the next pop as
+    children of that node. Survived children are matched to later pops by set ``s``.
+    """
+    with open(path, "r", encoding="utf-8") as fp:
+        lines = [ln.rstrip("\n") for ln in fp]
+
+    nodes: Dict[int, TreeNode] = {
+        0: TreeNode(id=0, parent_id=-1, s="[]", ub=None, status="pushed"),
+    }
+    next_id = 1
+    pop_counter = 0
+    current_pop_id: Optional[int] = 0
+    pending_pop: Optional[Dict[str, object]] = None
+    pending: Dict[str, Deque[int]] = defaultdict(deque)
+    run_meta: Dict[str, str] = {}
+    incumbent_f: Optional[float] = None
+
+    eval_s: Optional[str] = None
+    eval_ub: Optional[float] = None
+    eval_killed: Optional[bool] = None
+
+    def _attach_child(nid: int, parent_id: int) -> None:
+        parent = nodes.get(parent_id)
+        child = nodes[nid]
+        child.parent_id = parent_id
+        if parent is not None and child not in parent.children:
+            parent.children.append(child)
+
+    def _flush_eval() -> None:
+        nonlocal eval_s, eval_ub, eval_killed, next_id
+        if eval_s is None or current_pop_id is None:
+            eval_s = eval_ub = None
+            eval_killed = None
+            return
+        s_key = normalize_set(eval_s)
+        ub = eval_ub
+        killed = eval_killed if eval_killed is not None else False
+        nid = next_id
+        next_id += 1
+        status = "pruned_pre" if killed else "pushed"
+        tn = TreeNode(
+            id=nid,
+            parent_id=current_pop_id,
+            s=s_key,
+            ub=ub,
+            status=status,
+        )
+        if killed:
+            tn.prune_reason = "alpha_lb"
+        nodes[nid] = tn
+        _attach_child(nid, current_pop_id)
+        if not killed:
+            pending[s_key].append(nid)
+        eval_s = eval_ub = None
+        eval_killed = None
+
+    def _complete_pop(s_raw: str) -> None:
+        nonlocal pop_counter, current_pop_id, next_id, pending_pop
+        if pending_pop is None:
+            return
+        _flush_eval()
+        pop_counter += 1
+        depth = int(pending_pop["depth"])
+        ub = float(pending_pop["ub"])
+        s_key = normalize_set(s_raw)
+
+        if depth == 0 and s_key == "[]":
+            nid = 0
+            nodes[0].s = s_key
+        elif pending[s_key]:
+            nid = pending[s_key].popleft()
+        else:
+            nid = next_id
+            next_id += 1
+            nodes[nid] = TreeNode(
+                id=nid,
+                parent_id=current_pop_id if current_pop_id is not None else 0,
+                s=s_key,
+                ub=ub,
+                status="pushed",
+            )
+            _attach_child(nid, current_pop_id if current_pop_id is not None else 0)
+
+        target = nodes[nid]
+        target.pop_seq = pop_counter
+        target.ub = ub
+        if target.s in ("[?]", "[]") and s_key != "[]":
+            target.s = s_key
+        current_pop_id = nid
+        pending_pop = None
+
+    for line in lines:
+        m_zh = _LEGACY_POP_ZH_RE.search(line)
+        m_en = _LEGACY_POP_EN_RE.search(line)
+        if m_zh or m_en:
+            m = m_zh or m_en
+            _flush_eval()
+            pending_pop = {
+                "node": int(m.group("node")),
+                "depth": int(m.group("depth")),
+                "ub": float(m.group("ub")),
+            }
+            m_s = _LEGACY_S_ZH_RE.search(line) or _LEGACY_S_EN_RE.search(line)
+            if m_s:
+                _complete_pop(m_s.group(1))
+            continue
+
+        if pending_pop is not None:
+            m_s = _LEGACY_S_ZH_RE.search(line) or _LEGACY_S_EN_RE.search(line)
+            if m_s:
+                _complete_pop(m_s.group(1))
+                continue
+
+        m_eval = _LEGACY_EVAL_RE.search(line)
+        if m_eval:
+            _flush_eval()
+            eval_s = m_eval.group(1)
+            eval_ub = None
+            eval_killed = None
+            m_ub = _LEGACY_UB_RE.search(line)
+            if m_ub:
+                eval_ub = float(m_ub.group(1))
+            continue
+
+        if eval_s is not None:
+            m_ub = _LEGACY_UB_RE.search(line)
+            if m_ub:
+                eval_ub = float(m_ub.group(1))
+            if re.search(r"\[KILLED\]|KILLED|剪枝", line, re.IGNORECASE):
+                eval_killed = True
+            elif re.search(r"\[SURVIVED\]|SURVIVED|入堆", line, re.IGNORECASE):
+                eval_killed = False
+
+        m_f = _LEGACY_FINAL_F_RE.search(line)
+        if m_f:
+            incumbent_f = float(m_f.group(1))
+        m_st = _LEGACY_STRATEGY_RE.search(line)
+        if m_st and "strategy" not in run_meta:
+            run_meta["strategy"] = m_st.group(1)
+
+    _flush_eval()
+
+    return TreeView(
+        run_meta=run_meta,
+        nodes=nodes,
+        final_s=None,
+        incumbent_s=None,
+        incumbent_f=incumbent_f,
+    )
+
+
+def load_tree_view(path: str) -> TreeView:
+    """Load a log file using unified events when present, else the legacy adapter."""
+    events = list(iter_events(path))
+    if _unified_tree_event_kinds(events):
+        return build_tree(events)
+    with open(path, "r", encoding="utf-8") as fp:
+        body = fp.read()
+    if _legacy_line_indicators(body):
+        return build_tree_from_legacy(path)
+    return build_tree(events)
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +559,8 @@ def render_tree(
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Render the search tree of one experiment log file (unified format). "
-            "Output is plain ASCII."
+            "Render the search tree of one experiment log file (unified logfmt or "
+            "legacy [POP]/[EVAL] traces). Output is plain ASCII."
         )
     )
     parser.add_argument("log", help="path to the *_log.txt file to parse")
@@ -357,7 +580,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    view = build_tree(iter_events(args.log))
+    view = load_tree_view(args.log)
     text = render_tree(view, max_nodes=args.max_nodes, hide_pruned=args.hide_pruned)
 
     if args.output:

@@ -62,6 +62,69 @@ class TestBuildTree(unittest.TestCase):
         self.assertEqual(view.incumbent_f, 8.0)
 
 
+class TestLegacyAdapter(unittest.TestCase):
+    """Legacy ``[POP]`` / ``[EVAL]`` logs (localized or English)."""
+
+    _SNIPPET = """
+🟢 [POP] Node #1 | Depth: 0 | Cost: 0/13.0 | UB: 652.41
+   => 当前集合 S: []
+  ├── [EVAL] 评估子节点 S: []
+  │   └── 原始 UB: 630.37
+  │   └── ✅ [SURVIVED] 界限达标，准备入堆！
+  ├── [EVAL] 评估子节点 S: [663]
+  │   └── 原始 UB: 643.67
+  │   └── ✅ [SURVIVED] 界限达标，准备入堆！
+
+🟢 [POP] Node #2 | Depth: 1 | Cost: 1.5/13.0 | UB: 632.82
+   => 当前集合 S: [663]
+  ├── [EVAL] 评估子节点 S: [663]
+  │   └── 原始 UB: 626.88
+  │   └── ✅ [SURVIVED] 界限达标，准备入堆！
+  ├── [EVAL] 评估子节点 S: [419, 663]
+  │   └── 原始 UB: 635.73
+  │   └── ✅ [SURVIVED] 界限达标，准备入堆！
+
+🟢 [POP] Node #3 | Depth: 2 | Cost: 2.6/13.0 | UB: 626.33
+   => 当前集合 S: [419, 663]
+  ├── [EVAL] 评估子节点 S: [419, 663]
+  │   └── 原始 UB: 613.64
+  │   └── ✅ [SURVIVED] 界限达标，准备入堆！
+  ├── [EVAL] 评估子节点 S: [89, 419, 663]
+  │   └── 原始 UB: 628.74
+  │   └── ❌ [KILLED] 剪枝生效，节点已被抹杀。
+  [OK] Strategy: traditional    | h:ub2  | f(S):601.27 | Nodes: 3     | Time: 1.00s
+"""
+
+    def test_build_tree_from_legacy_snippet(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8") as fp:
+            fp.write(self._SNIPPET)
+            path = fp.name
+        try:
+            view = dst.build_tree_from_legacy(path)
+            self.assertEqual(view.nodes[0].pop_seq, 1)
+            self.assertEqual(view.nodes[0].s, "[]")
+            # Root should have two children from first pop's evals.
+            self.assertEqual(len(view.nodes[0].children), 2)
+            pruned = [n for n in view.nodes.values() if n.prune_reason]
+            self.assertGreaterEqual(len(pruned), 1)
+            self.assertTrue(any(n.s == "[89,419,663]" for n in pruned))
+            popped = [n for n in view.nodes.values() if n.pop_seq == 3]
+            self.assertEqual(len(popped), 1)
+            self.assertEqual(popped[0].s, "[419,663]")
+            self.assertAlmostEqual(view.incumbent_f or 0, 601.27, places=1)
+        finally:
+            os.unlink(path)
+
+    def test_load_tree_view_prefers_unified(self):
+        events = [
+            ("NODE_PUSH", {"parent_id": "0", "id": "1", "s": "[1]", "ub": "8", "status": "pushed"}),
+            ("NODE_POP", {"id": "1", "s": "[1]", "ub": "8"}),
+        ]
+        view = dst.build_tree(events)
+        self.assertEqual(len(view.nodes), 2)
+
+
 class TestRenderTree(unittest.TestCase):
     def _build(self, lines):
         events = [parsed for parsed in (dst.parse_event_line(l) for l in lines)

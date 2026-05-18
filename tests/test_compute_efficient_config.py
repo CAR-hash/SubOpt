@@ -19,6 +19,17 @@ class TestLoadEfficientRunConfig(unittest.TestCase):
             self.assertEqual(cfg.heuristic, "ub2")
             self.assertEqual(cfg.heuristics, ["ub2"])
             self.assertEqual(cfg.branching, ["traditional", "density_gap", "look_ahead"])
+            self.assertFalse(cfg.runlog_verbose)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_runlog_verbose_from_json(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump({"task": "youtube", "runlog_verbose": True}, f)
+            path = f.name
+        try:
+            cfg = compute_efficient_config.load_efficient_run_config(path)
+            self.assertTrue(cfg.runlog_verbose)
         finally:
             Path(path).unlink(missing_ok=True)
 

@@ -61,6 +61,9 @@ _DEFAULT_FLAT: dict[str, Any] = {
     # Per-run wall-clock cap (seconds). Applied to ``EfficientBFS`` (TimerProxy) and to
     # ``BFSTC`` / ``EfficientBranchAndBound`` (their internal ``time_limit`` field).
     "time_limit_seconds": 5000.0,
+    # When true, emit high-frequency run-log events (``NODE_PUSH`` / ``NODE_POP`` /
+    # ``NODE_PRUNE``) so ``tools/draw_search_tree.py`` can reconstruct the search tree.
+    "runlog_verbose": False,
 }
 
 ALLOWED_KEYS: FrozenSet[str] = frozenset(_DEFAULT_FLAT.keys())
@@ -113,6 +116,7 @@ class EfficientRunConfig:
     budget_num_points: int
     budget_interval: float
     time_limit_seconds: float
+    runlog_verbose: bool
 
     @property
     def supports_branching(self) -> bool:
@@ -285,6 +289,7 @@ def _merged_dict_to_config(m: Mapping[str, Any]) -> EfficientRunConfig:
         budget_num_points=m["budget_num_points"],
         budget_interval=float(m["budget_interval"]),
         time_limit_seconds=float(m["time_limit_seconds"]),
+        runlog_verbose=_coerce_bool(m["runlog_verbose"], "runlog_verbose"),
     )
 
 

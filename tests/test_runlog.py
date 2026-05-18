@@ -83,11 +83,11 @@ class TestAlgorithmEmission(unittest.TestCase):
         except ModuleNotFoundError:
             self.skipTest("optional algorithm modules not importable")
 
-    def _tiny_model(self):
+    def _tiny_model(self, n=6, budget=4.0):
         from base_task import BaseTask
 
         class TinyKnapsackTask(BaseTask):
-            def __init__(self, n=6, budget=4.0):
+            def __init__(self, n=n, budget=budget):
                 super().__init__()
                 self._ground = list(range(n))
                 self.budget = budget
@@ -124,14 +124,39 @@ class TestAlgorithmEmission(unittest.TestCase):
         from filter_search import EfficientBranchAndBound
         buf = io.StringIO()
         log = runlog.RunLogger(stream=buf, run_id="t", verbose=True)
-        alg = EfficientBranchAndBound(self._tiny_model())
+        alg = EfficientBranchAndBound(self._tiny_model(n=10, budget=5.0))
         alg.runlog = log
-        alg.alpha = 1.0
+        alg.alpha = 0.95
+        alg.time_limit = 60.0
         alg.build()
         alg.optimize()
         out = buf.getvalue()
         self.assertIn("[GREEDY_DONE]", out)
         self.assertIn("[RUN_END]", out)
+        self.assertIn("[NODE_POP]", out)
+
+    def test_ebb_node_pop_ub_is_local_bound_not_incumbent(self):
+        """``NODE_POP`` must carry ``f_local`` (ub=…), not the global incumbent lb."""
+        import re
+        from filter_search import EfficientBranchAndBound
+
+        buf = io.StringIO()
+        log = runlog.RunLogger(stream=buf, verbose=True)
+        alg = EfficientBranchAndBound(self._tiny_model(n=10, budget=5.0))
+        alg.runlog = log
+        alg.alpha = 0.95
+        alg.time_limit = 60.0
+        alg.build()
+        alg.optimize()
+        pops = re.findall(r"\[NODE_POP\][^\n]+", buf.getvalue())
+        self.assertGreaterEqual(len(pops), 1)
+        first = pops[0]
+        self.assertIn("ub=", first)
+        m = re.search(r"ub=([\d.]+)", first)
+        self.assertIsNotNone(m)
+        pop_ub = float(m.group(1))
+        # First pop is the root; ``f_local`` after greedy is well above zero.
+        self.assertGreater(pop_ub, 0.0)
 
 
 if __name__ == "__main__":
