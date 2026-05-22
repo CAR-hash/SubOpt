@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pickle
 import random
@@ -13,6 +14,22 @@ import algorithm_factory
 import compute_efficient_config
 import model_factory
 import runlog
+
+
+def _json_safe(v):
+    if isinstance(v, dict):
+        return {str(k): _json_safe(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    if isinstance(v, set):
+        return sorted(_json_safe(x) for x in v)
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    return v
 
 
 def _wrap_result_with_meta(
@@ -43,6 +60,7 @@ def _wrap_result_with_meta(
         "strategy": strategy_name_for_file,
         "strategy_raw": strategy_raw,
         "heuristic": heuristic,
+        "aux_heuristic": str(cfg.aux_heuristic),
         "d": cfg.sorting,
         "budget": float(budget),
         "alpha": float(cfg.alpha),
@@ -57,6 +75,30 @@ def _wrap_result_with_meta(
         "adaptive_ratio": float(cfg.adaptive_ratio),
     }
     return out
+
+
+def _result_filename(
+    *,
+    algorithm: str,
+    strategy_name_for_file: str,
+    heuristic: str,
+    aux_heuristic: str,
+    sorting: str,
+    budget: float,
+    alpha: float,
+    model_class_name: str,
+) -> str:
+    """Result basename; aux segment prevents ub2/auxub0 vs ub2/auxub2 collisions."""
+    return "{}-{}-{}-aux{}-{}-{}-{}-{}.pckl".format(
+        algorithm,
+        strategy_name_for_file,
+        heuristic,
+        aux_heuristic,
+        sorting,
+        budget,
+        alpha,
+        model_class_name,
+    )
 
 
 if __name__ == "__main__":
@@ -215,17 +257,17 @@ if __name__ == "__main__":
                             save_dir = os.path.join(root_dir, cfg.task, str(cfg.num), str(seed))
                             os.makedirs(save_dir, exist_ok=True)
 
-                            # Filename embeds the algorithm name so siblings from different
-                            # algorithms don't collide. Metadata in the pickle remains the
-                            # source of truth for downstream parsing.
-                            filename = "{}-{}-{}-{}-{}-{}-{}.pckl".format(
-                                cfg.algorithm,
-                                strategy_name_for_file,
-                                heuristic,
-                                cfg.sorting,
-                                budget,
-                                cfg.alpha,
-                                model.__class__.__name__,
+                            # Filename embeds algorithm + heuristic + aux so ub2/auxub0
+                            # and ub2/auxub2 (same path) do not overwrite each other.
+                            filename = _result_filename(
+                                algorithm=cfg.algorithm,
+                                strategy_name_for_file=strategy_name_for_file,
+                                heuristic=heuristic,
+                                aux_heuristic=str(cfg.aux_heuristic),
+                                sorting=cfg.sorting,
+                                budget=budget,
+                                alpha=cfg.alpha,
+                                model_class_name=model.__class__.__name__,
                             )
                             save_path = os.path.join(save_dir, filename)
 
@@ -242,5 +284,16 @@ if __name__ == "__main__":
                             )
                             with open(save_path, "wb") as wrt:
                                 pickle.dump(wrapped, wrt)
+                            should_write_json = bool(cfg.write_json) or str(cfg.archive) == "109"
+                            if should_write_json:
+                                json_path = os.path.splitext(save_path)[0] + ".json"
+                                json_obj = {
+                                    "meta": wrapped.get("meta", {}),
+                                    "result": {k: v for k, v in wrapped.items() if k != "meta"},
+                                    "source_pickle": save_path,
+                                    "source_pickle_name": os.path.basename(save_path),
+                                }
+                                with open(json_path, "w", encoding="utf-8") as jwrt:
+                                    json.dump(_json_safe(json_obj), jwrt, ensure_ascii=False, indent=2)
 
     print("\n[DONE] All experiments completed!")

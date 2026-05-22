@@ -196,3 +196,4 @@ dataset/custom-graph/
 output/
 *.png
 notebooks/postgres_config.json
+notebooks/notebooks.zip

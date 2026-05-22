@@ -1,0 +1,9 @@
+task,alpha,missing
+adult,0.95,EfficientBFS  ub2/ub0
+adult,0.98,EfficientBFS  ub2/ub0; BFSTC  ub0/ub0
+caltech,0.95,EfficientBFS  ub2/ub0
+caltech,0.98,EfficientBFS  ub2/ub0; BFSTC  ub0/ub0; EBB  ub0/ub0
+facebook,0.95,EfficientBFS  ub2/ub0
+facebook,0.98,EfficientBFS  ub2/ub0; BFSTC  ub0/ub0; EBB  ub0/ub0
+youtube,0.95,EfficientBFS  ub2/ub0
+youtube,0.98,EfficientBFS  ub2/ub0; BFSTC  ub0/ub0; EBB  ub0/ub0

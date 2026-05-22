@@ -15,11 +15,13 @@ def _resolve_source_config(args: argparse.Namespace) -> Path:
     return Path(args.config).resolve()
 
 
-def _single_dataset_payload(cfg) -> dict:
+def _single_dataset_payload(cfg, force_write_json=None) -> dict:
     data = asdict(cfg)
     task = data.pop("task")
     num = data.pop("num")
     data["datasets"] = [{"task": task, "num": num}]
+    if force_write_json is not None:
+        data["write_json"] = bool(force_write_json)
     return data
 
 
@@ -68,10 +70,28 @@ def main() -> int:
         help="python executable for subprocesses (default: current interpreter)",
     )
     parser.add_argument("--dry-run", action="store_true", help="print commands without running")
+    parser.add_argument(
+        "--write-json",
+        action="store_true",
+        help="force write_json=true in generated per-job configs",
+    )
+    parser.add_argument(
+        "--no-write-json",
+        action="store_true",
+        help="force write_json=false in generated per-job configs",
+    )
+    parser.add_argument(
+        "--job-tag",
+        default="",
+        metavar="NAME",
+        help="subfolder under archive-*/launcher-jobs/ (avoids collisions when launching several configs)",
+    )
     args = parser.parse_args()
 
     if args.max_workers < 1:
         parser.error("--max-workers must be >= 1")
+    if args.write_json and args.no_write_json:
+        parser.error("use only one of --write-json / --no-write-json")
 
     repo_root = Path(__file__).resolve().parent
     source_cfg = _resolve_source_config(args)
@@ -80,7 +100,8 @@ def main() -> int:
         raise RuntimeError("No dataset jobs found in config.")
 
     archive_id = str(run_cfgs[0].archive)
-    job_dir = repo_root / "result" / f"archive-{archive_id}" / "launcher-jobs"
+    job_root = repo_root / "result" / f"archive-{archive_id}" / "launcher-jobs"
+    job_dir = job_root / args.job_tag if args.job_tag else job_root
     job_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Source config: {source_cfg}")
@@ -88,8 +109,13 @@ def main() -> int:
     print(f"Per-job configs/logs: {job_dir}")
 
     jobs = []
+    force_write_json = None
+    if args.write_json:
+        force_write_json = True
+    elif args.no_write_json:
+        force_write_json = False
     for i, cfg in enumerate(run_cfgs, start=1):
-        payload = _single_dataset_payload(cfg)
+        payload = _single_dataset_payload(cfg, force_write_json=force_write_json)
         cfg_path = _write_job_config(job_dir, i, payload)
         out_log_path = job_dir / f"job_{i:02d}_{cfg.task}.launcher.log"
         jobs.append((i, cfg.task, cfg_path, out_log_path))
